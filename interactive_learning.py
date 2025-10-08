@@ -1,5 +1,5 @@
 # bnc_interactive_train.py
-import os, re, math, random, json, argparse, itertools
+import os, re, math, random, json, argparse, itertools, time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
@@ -12,9 +12,15 @@ from datasets import load_dataset, IterableDatasetDict
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 
+# Import the color logger
+from color_logger import get_logger, MLColors, Fore, Style
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
 torch.manual_seed(7)
+
+# Initialize the color logger
+logger = get_logger("BabyLM-Interactive")
 
 # -----------------------
 # Caregiver (heuristic); swap with LLM later
@@ -96,6 +102,8 @@ class BNCPrefixStream(IterableDataset):
                     yield sent
 
     def _iterate_dir(self):
+        if self.bnc_dir is None:
+            return
         for root,_,files in os.walk(self.bnc_dir):
             for f in files:
                 if not f.lower().endswith(".txt"): continue
@@ -116,7 +124,22 @@ class BNCPrefixStream(IterableDataset):
             # choose a short prefix from each sentence
             words = sent.split()
             if len(words) < 4: continue
-            L = random.randint(8, min(20, len(words)))
+            
+            # Ensure we have a valid range for randint
+            min_len = 4  # minimum prefix length
+            max_len = min(20, len(words))  # maximum prefix length
+            
+            if max_len < min_len:
+                continue  # skip sentences that are too short
+            
+            # Choose prefix length between min_len and max_len
+            if max_len >= 8:
+                # Prefer longer prefixes (8-20 words) when possible
+                L = random.randint(8, max_len)
+            else:
+                # For shorter sentences, use what we have (4-7 words)
+                L = random.randint(min_len, max_len)
+            
             prefix = " ".join(words[:L])
             # assign weak tag
             tag = "other"
@@ -261,39 +284,62 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    
+    logger.info(f"🚀 Starting interactive learning with {Fore.YELLOW}{args.model_name}{Style.RESET_ALL}")
+    logger.info(f"Device: {Fore.GREEN}{DEVICE}{Style.RESET_ALL}")
+    logger.info(f"Batch size: {args.batch_size}, Steps: {args.steps:,}, LR: {args.lr}")
+    logger.info(f"Save directory: {args.save_dir}")
 
+    logger.info("Loading tokenizer...")
     tok = AutoTokenizer.from_pretrained(args.model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
     # Student + LoRA
+    logger.info("Setting up student model with LoRA...")
     base = AutoModelForCausalLM.from_pretrained(args.model_name)
     lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["c_attn","c_proj","q_proj","v_proj","k_proj","o_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
     student = get_peft_model(base, lora_cfg).to(DEVICE)
     student.train()
+    
+    trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in student.parameters())
+    logger.info(f"Trainable parameters: {Fore.GREEN}{trainable_params:,}{Style.RESET_ALL} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
 
     # Reference (frozen)
+    logger.info("Loading reference model...")
     reference = AutoModelForCausalLM.from_pretrained(args.model_name).to(DEVICE)
     reference.eval()
 
+    logger.info("Setting up heuristic caregiver...")
     caregiver = HeuristicCaregiver()
 
     # Data stream
     bnc_name = args.bnc_name if args.bnc_name else None
     bnc_dir  = args.bnc_dir if args.bnc_dir else None
+    logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
     ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
     loader = DataLoader(ds, batch_size=args.batch_size)
 
     # Optim & sched
+    logger.info("Setting up optimizer and scheduler...")
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, betas=(0.9,0.95), weight_decay=0.01)
     sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=500, num_training_steps=args.steps)
 
     budget = WordBudget(100_000_000)
+    logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     # Initial eval
+    logger.info("Running initial evaluation...")
     bl0 = mini_blimp(student, tok)
     mo0 = mini_morph(student, tok)
-    print(f"[Init] mini-BLiMP={bl0:.3f}  Morph={mo0:.3f}")
+    logger.eval(0, f"Initial scores - BLiMP: {Fore.YELLOW}{bl0:.3f}{Style.RESET_ALL}, Morph: {Fore.YELLOW}{mo0:.3f}{Style.RESET_ALL}")
+    
+    logger.success("🎯 Starting training loop...")
+    logger.info(f"📊 Progress will be tracked with {'tqdm' if hasattr(logger, 'progress_bar') else 'basic'} progress bars")
+    
+    # Create progress bar for training
+    progress_bar = logger.create_progress_bar(args.steps, "🚀 Training")
 
     step = 0
     for batch in loader:
@@ -305,6 +351,22 @@ def main():
         # Caregiver corrections
         outs = [caregiver.correct(x, y) for x, y in zip(prefixes, attempts)]
         y_star = [o.corrected for o in outs]
+        
+        # Track correction statistics for logging
+        if step % 200 == 0:  # Less frequent than main logging
+            tag_counts = {}
+            for o in outs:
+                tag_counts[o.tag] = tag_counts.get(o.tag, 0) + 1
+            
+            if any(tag != "other" for tag in tag_counts):
+                corrections_msg = []
+                for tag, count in sorted(tag_counts.items()):
+                    if tag != "other" and count > 0:
+                        color = Fore.GREEN if tag in ["agreement", "reflexive"] else Fore.CYAN
+                        corrections_msg.append(f"{color}{tag}: {count}{Style.RESET_ALL}")
+                
+                if corrections_msg:
+                    logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
 
         # Losses
         L_sft = ce_targets(student, tok, prefixes, y_star)
@@ -328,22 +390,90 @@ def main():
         # Budget: only count texts we train ON (y*)
         budget.add(y_star)
         if not budget.ok():
-            print("[Budget] Reached 100M word limit. Stopping.")
+            logger.warning("⚠️  Reached 100M word limit. Stopping training.")
             break
 
-        if step % 100 == 0:
-            print(f"[{step}] L_sft={L_sft.item():.3f}  L_kl={L_kl.item():.3f}  L_dpo={L_dpo.item():.3f}  Used≈{budget.used/1e6:.1f}M words")
+        # Update progress bar with current metrics
+        current_lr = sched.get_last_lr()[0]
+        progress_metrics = {
+            "SFT_loss": L_sft.item(),
+            "KL_loss": L_kl.item(), 
+            "DPO_loss": L_dpo.item(),
+            "LR": f"{current_lr:.1e}",
+            "Words": f"{budget.used/1e6:.1f}M"
+        }
+        logger.update_progress(step, **progress_metrics)
 
+        # Detailed logging every 100 steps (less frequent than progress bar)
+        if step % 100 == 0:
+            # Use the enhanced loss display from the logger
+            losses = {"SFT": L_sft.item(), "KL": L_kl.item(), "DPO": L_dpo.item()}
+            thresholds = {"SFT": (2.0, 3.0), "KL": (0.1, 0.5), "DPO": (1.0, 2.0)}
+            
+            loss_display = logger.loss_display(losses, thresholds)
+            extra_info = f"LR: {Fore.CYAN}{current_lr:.2e}{Style.RESET_ALL} | 📚 {Fore.CYAN}{budget.used/1e6:.1f}M{Style.RESET_ALL} words"
+            
+            logger.step(step, f"📊 {loss_display} | {extra_info}")
+
+        # Evaluation and checkpointing
         if step % args.eval_every == 0:
+            logger.info("🔍 Running evaluation...")
             bl = mini_blimp(student, tok)
             mo = mini_morph(student, tok)
-            print(f"[Eval {step}] mini-BLiMP={bl:.3f}  Morph={mo:.3f}")
-            # save LoRA adapter
-            student.save_pretrained(os.path.join(args.save_dir, f"step_{step}"))
+            
+            # Update progress bar with evaluation metrics
+            eval_metrics = {
+                "SFT_loss": L_sft.item(),
+                "KL_loss": L_kl.item(), 
+                "DPO_loss": L_dpo.item(),
+                "BLiMP_score": bl,
+                "Morph_score": mo,
+                "Words": f"{budget.used/1e6:.1f}M"
+            }
+            logger.update_progress(step, **eval_metrics)
+            
+            # Use the enhanced metric display
+            bl_metric = logger.metric("BLiMP", f"{bl:.3f}", good_threshold=0.7, warn_threshold=0.5)
+            mo_metric = logger.metric("Morph", f"{mo:.3f}", good_threshold=0.7, warn_threshold=0.5)
+            
+            logger.eval(step, f"{bl_metric}, {mo_metric}")
+            
+            # Save checkpoint
+            save_path = os.path.join(args.save_dir, f"step_{step}")
+            student.save_pretrained(save_path)
+            logger.success(f"💾 Saved checkpoint: {save_path}")
 
         if step >= args.steps:
-            print("[Done] Reached max steps.")
+            logger.success("🎉 Reached maximum steps. Training complete!")
             break
+    
+    # Close progress bar
+    logger.close_progress_bar()
+    
+    # Final evaluation and summary
+    logger.info("🏁 Running final evaluation...")
+    final_bl = mini_blimp(student, tok)
+    final_mo = mini_morph(student, tok)
+    
+    # Calculate improvements
+    bl_improvement = final_bl - bl0
+    mo_improvement = final_mo - mo0
+    
+    # Create summary using the enhanced logger
+    summary_data = {
+        "Final BLiMP": (f"{final_bl:.3f} (Δ{bl_improvement:+.3f})", MLColors.improvement_colors(bl_improvement)),
+        "Final Morph": (f"{final_mo:.3f} (Δ{mo_improvement:+.3f})", MLColors.improvement_colors(mo_improvement)),
+        "Total Steps": (f"{step:,}", None),
+        "Words Processed": (f"{budget.used/1e6:.1f}M / {budget.limit/1e6:.0f}M", None),
+        "Training Time": (f"{time.time() - logger.start_time:.1f}s", None),
+    }
+    
+    logger.summary_table(summary_data, "🎉 TRAINING COMPLETE")
+    
+    # Save final model
+    final_path = os.path.join(args.save_dir, "final")
+    student.save_pretrained(final_path)
+    logger.success(f"💾 Final model saved: {final_path}")
 
 if __name__ == "__main__":
     main()
