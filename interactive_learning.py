@@ -3,6 +3,9 @@ import os, re, math, random, json, argparse, itertools, time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
+# Suppress tokenizer parallelism warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,18 +164,31 @@ def batchify(items, bs):
 @torch.no_grad()
 def generate(model, tok, prefixes: List[str], max_new_tokens=12, temperature=0.9, top_p=0.9):
     model.eval()
+    
+    # Batch tokenization for efficiency
+    ids = tok(prefixes, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    
+    # Batch generation
+    outputs = model.generate(
+        **ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=True, 
+        temperature=temperature, 
+        top_p=top_p,
+        pad_token_id=tok.eos_token_id,
+        eos_token_id=tok.eos_token_id
+    )
+    
+    # Decode only the generated parts (skip input tokens)
     outs = []
-    for x in prefixes:
-        ids = tok(x, return_tensors="pt").to(DEVICE)
-        out = model.generate(
-            **ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=True, temperature=temperature, top_p=top_p,
-            pad_token_id=tok.eos_token_id,
-            eos_token_id=tok.eos_token_id
-        )
-        gen = tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        outs.append(gen.strip())
+    input_lengths = ids["input_ids"].shape[1]
+    for i, output in enumerate(outputs):
+        # Find actual input length for this sequence (accounting for padding)
+        actual_input_len = (ids["input_ids"][i] != tok.pad_token_id).sum().item()
+        gen_tokens = output[actual_input_len:]
+        gen_text = tok.decode(gen_tokens, skip_special_tokens=True)
+        outs.append(gen_text.strip())
+    
     return outs
 
 def ce_targets(student, tok, x_list, y_list):
@@ -242,17 +258,66 @@ MORPH_GOOD    = [" creativity.", " activity impressed them."]
 MORPH_BAD     = [" creativeness.", " activeness impressed them."]
 
 @torch.no_grad()
+def simple_logprob(model, tok, full_text):
+    """Calculate logprob of full text sequence (simpler than logprob_sum)."""
+    model.eval()
+    # Temporarily switch to right padding for evaluation to avoid complexity
+    orig_padding_side = tok.padding_side
+    tok.padding_side = 'right'
+    
+    try:
+        enc = tok(full_text, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+        out = model(**enc)
+        logits = out.logits
+        
+        # Calculate log probabilities
+        logp = F.log_softmax(logits, dim=-1)
+        # Get target tokens (shifted by 1)
+        tgt = enc.input_ids[:, 1:].clone()
+        # Get log probabilities for target tokens
+        lp = logp[:, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+        # Mask out padding tokens
+        mask = (tgt != tok.pad_token_id) & (enc.attention_mask[:, 1:] == 1)
+        # Sum log probabilities for each sequence
+        lp_sum = (lp * mask).sum(dim=1)
+        return lp_sum
+    finally:
+        # Restore original padding side
+        tok.padding_side = orig_padding_side
+
+@torch.no_grad()
 def mini_blimp(model, tok):
-    xs, g, b = zip(*BLIMP_MINI)
-    lp_g = logprob_sum(model, tok, list(xs), list(g))
-    lp_b = logprob_sum(model, tok, list(xs), list(b))
-    return (lp_g > lp_b).float().mean().item()
+    correct = 0
+    total = len(BLIMP_MINI)
+    
+    for prefix, good, bad in BLIMP_MINI:
+        good_text = prefix + good
+        bad_text = prefix + bad
+        
+        lp_good = simple_logprob(model, tok, [good_text])
+        lp_bad = simple_logprob(model, tok, [bad_text])
+        
+        if lp_good[0] > lp_bad[0]:
+            correct += 1
+    
+    return correct / total
 
 @torch.no_grad()
 def mini_morph(model, tok):
-    lp1 = logprob_sum(model, tok, MORPH_STEMS, MORPH_GOOD)
-    lp2 = logprob_sum(model, tok, MORPH_STEMS, MORPH_BAD)
-    return (lp1 > lp2).float().mean().item()
+    correct = 0
+    total = len(MORPH_STEMS)
+    
+    for i, stem in enumerate(MORPH_STEMS):
+        good_text = stem + MORPH_GOOD[i]
+        bad_text = stem + MORPH_BAD[i]
+        
+        lp_good = simple_logprob(model, tok, [good_text])
+        lp_bad = simple_logprob(model, tok, [bad_text])
+        
+        if lp_good[0] > lp_bad[0]:
+            correct += 1
+    
+    return correct / total
 
 # -----------------------
 # Word budget
@@ -289,11 +354,21 @@ def main():
     logger.info(f"Device: {Fore.GREEN}{DEVICE}{Style.RESET_ALL}")
     logger.info(f"Batch size: {args.batch_size}, Steps: {args.steps:,}, LR: {args.lr}")
     logger.info(f"Save directory: {args.save_dir}")
+    
+    # Performance optimization notices
+    if args.batch_size < 16:
+        logger.warning(f"⚠️  Small batch size ({args.batch_size}) may cause slow training. Consider increasing to 32-64 for better GPU utilization.")
+    logger.info(f"🚀 Performance optimizations: batch generation, parallel data loading, profiling enabled")
 
     logger.info("Loading tokenizer...")
     tok = AutoTokenizer.from_pretrained(args.model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    
+    # Fix padding side for decoder-only models (critical for generation quality)
+    tok.padding_side = 'left'
+    logger.info(f"Set tokenizer padding_side to: {Fore.GREEN}left{Style.RESET_ALL} (required for decoder-only models)")
+    logger.info(f"Suppressed tokenizer parallelism warnings via environment variable")
 
     # Student + LoRA
     logger.info("Setting up student model with LoRA...")
@@ -319,7 +394,8 @@ def main():
     bnc_dir  = args.bnc_dir if args.bnc_dir else None
     logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
     ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
-    loader = DataLoader(ds, batch_size=args.batch_size)
+    # Reduce workers to avoid tokenizer parallelism issues with streaming datasets
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
 
     # Optim & sched
     logger.info("Setting up optimizer and scheduler...")
@@ -342,15 +418,24 @@ def main():
     progress_bar = logger.create_progress_bar(args.steps, "🚀 Training")
 
     step = 0
+    step_times = {"data": 0.0, "generate": 0.0, "correct": 0.0, "forward": 0.0, "backward": 0.0}
+    
     for batch in loader:
+        step_start = time.time()
         step += 1
         prefixes = batch["prefix"]
+        step_times["data"] += time.time() - step_start
+        
         # Generate short student attempts
+        gen_start = time.time()
         attempts = generate(student, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9)
+        step_times["generate"] += time.time() - gen_start
 
         # Caregiver corrections
+        correct_start = time.time()
         outs = [caregiver.correct(x, y) for x, y in zip(prefixes, attempts)]
         y_star = [o.corrected for o in outs]
+        step_times["correct"] += time.time() - correct_start
         
         # Track correction statistics for logging
         if step % 200 == 0:  # Less frequent than main logging
@@ -369,6 +454,7 @@ def main():
                     logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
 
         # Losses
+        forward_start = time.time()
         L_sft = ce_targets(student, tok, prefixes, y_star)
         L_kl  = kl_to_ref(student, reference, tok, prefixes)
         L_dpo = torch.tensor(0.0, device=DEVICE)
@@ -381,11 +467,14 @@ def main():
                 L_dpo = dpo_loss(student, reference, tok, xs_dpo, yp, yn, beta=0.2)
 
         loss = L_sft + 0.03*L_kl + 0.5*L_dpo
+        step_times["forward"] += time.time() - forward_start
 
+        backward_start = time.time()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         opt.step(); sched.step()
+        step_times["backward"] += time.time() - backward_start
 
         # Budget: only count texts we train ON (y*)
         budget.add(y_star)
@@ -413,7 +502,19 @@ def main():
             loss_display = logger.loss_display(losses, thresholds)
             extra_info = f"LR: {Fore.CYAN}{current_lr:.2e}{Style.RESET_ALL} | 📚 {Fore.CYAN}{budget.used/1e6:.1f}M{Style.RESET_ALL} words"
             
-            logger.step(step, f"📊 {loss_display} | {extra_info}")
+            # Performance breakdown
+            total_time = sum(step_times.values())
+            if total_time > 0:
+                perf_info = []
+                for component, t in step_times.items():
+                    pct = (t / total_time) * 100
+                    color = Fore.RED if pct > 40 else Fore.YELLOW if pct > 20 else Fore.GREEN
+                    perf_info.append(f"{component}: {color}{pct:.1f}%{Style.RESET_ALL}")
+                
+                logger.step(step, f"📊 {loss_display} | {extra_info}")
+                logger.debug(f"⏱️  Performance: {' | '.join(perf_info)} (avg: {total_time/step:.2f}s/step)")
+            else:
+                logger.step(step, f"📊 {loss_display} | {extra_info}")
 
         # Evaluation and checkpointing
         if step % args.eval_every == 0:

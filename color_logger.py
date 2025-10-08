@@ -188,25 +188,34 @@ class ColorLogger:
         
         Args:
             name: Metric name
-            value: Metric value
+            value: Metric value (can be string or numeric)
             good_threshold: Threshold for green color
             warn_threshold: Threshold for yellow color
             higher_is_better: If True, higher values get better colors
         """
         color = Fore.WHITE  # default
         
-        if good_threshold is not None and warn_threshold is not None:
+        # Convert to float for comparison if it's a string representation of a number
+        numeric_value = value
+        if isinstance(value, str):
+            try:
+                numeric_value = float(value)
+            except ValueError:
+                # If conversion fails, just use default color
+                numeric_value = None
+        
+        if good_threshold is not None and warn_threshold is not None and numeric_value is not None:
             if higher_is_better:
-                if value >= good_threshold:
+                if numeric_value >= good_threshold:
                     color = Fore.GREEN
-                elif value >= warn_threshold:
+                elif numeric_value >= warn_threshold:
                     color = Fore.YELLOW
                 else:
                     color = Fore.RED
             else:  # lower is better
-                if value <= good_threshold:
+                if numeric_value <= good_threshold:
                     color = Fore.GREEN
-                elif value <= warn_threshold:
+                elif numeric_value <= warn_threshold:
                     color = Fore.YELLOW
                 else:
                     color = Fore.RED
@@ -227,6 +236,7 @@ class ColorLogger:
         loss_strs = []
         for name, value in losses_dict.items():
             good_thresh, warn_thresh = thresholds.get(name, (None, None))
+            # Use the metric method which now handles both numeric values and strings
             loss_str = self.metric(name, f"{value:.3f}", good_thresh, warn_thresh, higher_is_better=False)
             loss_strs.append(loss_str)
         
