@@ -344,24 +344,38 @@ def batchify(items, bs):
 @torch.no_grad()
 def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9):
     model.eval()
-    ids = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=480).to(DEVICE)
-    
-    # Remove temperature from generation call since it's causing warnings
-    # Use do_sample=True with top_p for similar randomness
-    outputs = model.generate(
-        **ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=True, 
-        top_p=top_p,
-        pad_token_id=tok.eos_token_id, 
-        eos_token_id=tok.eos_token_id
-    )
-    outs = []
-    for i, output in enumerate(outputs):
-        actual_input_len = (ids["input_ids"][i] != tok.pad_token_id).sum().item()
-        gen_tokens = output[actual_input_len:]
-        outs.append(tok.decode(gen_tokens, skip_special_tokens=True).strip())
-    return outs
+    # Sort by length to reduce padding (then unsort)
+    lengths = [len(p.split()) for p in prefixes]
+    order = sorted(range(len(prefixes)), key=lambda i: lengths[i])
+    rev = [0]*len(order)
+    for i, oi in enumerate(order):
+        rev[oi] = i
+    ordered = [prefixes[i] for i in order]
+
+    enc = tok(ordered, return_tensors="pt", padding=True, truncation=True, max_length=480).to(DEVICE)
+
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        out = model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_p=top_p,
+            pad_token_id=tok.eos_token_id,
+            eos_token_id=tok.eos_token_id,
+            use_cache=True,
+        )
+    # Compute actual lengths once
+    input_lens = enc["attention_mask"].sum(dim=1).tolist()
+    gens = []
+    for i, seq in enumerate(out):
+        gen_part = seq[input_lens[i]:]
+        gens.append(tok.decode(gen_part, skip_special_tokens=True).strip())
+
+    # Unsort
+    restored = [None]*len(gens)
+    for i, gi in enumerate(gens):
+        restored[order[i]] = gi
+    return restored
 
 
 MAX_CONCAT = 512  # enough for short prefixes + short corrections
@@ -379,64 +393,72 @@ def ce_targets(student, tok, x_list, y_list):
                   labels=labels[:, :MAX_CONCAT])
     return out.loss
 
+# logprob_sum: remove incorrect divide by len(tok) and use autocast
 @torch.no_grad()
 def logprob_sum(model, tok, x_list, y_list, max_len=256):
     model.eval()
-    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
-    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
+        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+        labels = input_ids.clone()
+        labels[:, :enc_x.input_ids.shape[1]] = -100
+        out = model(input_ids=input_ids, attention_mask=attn_mask)
+        logits = out.logits[:, :-1]
+        tgt = labels[:, 1:]
+        mask_y = (tgt != -100)
+        logp_all = F.log_softmax(logits, dim=-1)
+        tgt_safe = tgt.masked_fill(~mask_y, 0)
+        token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
+        return (token_lp * mask_y).sum(dim=1)
 
+
+def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = None, temperature: float = 1.0):
+    """
+    Distillation-style KL(student || reference) on target tokens y conditioned on x.
+    Computes per-token KL across the vocabulary for positions corresponding to y.
+    Args:
+      xs: List[str] prefixes
+      y_pos: List[str] positive corrections (same length as xs)
+      y_neg: Optional[List[str]] negatives (ignored by default; can be added for extra regularization)
+      temperature: softening temperature for logits
+    Returns:
+      Scalar KL loss (mean over tokens and batch)
+    """
+    student.eval()
+    reference.eval()
+
+    # Encode x and y (only positives by default)
+    enc_x = tok(xs, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    enc_y = tok(y_pos, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+
+    # Build inputs and masks
     input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
     attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
 
-    # labels: predict only y tokens
+    # Labels to identify y positions (mask x with -100)
     labels = input_ids.clone()
-    # mask out x part
     labels[:, :enc_x.input_ids.shape[1]] = -100
 
-    # Causal LM predicts token t at logits[:, t-1], so shift both by one step.
-    # We’ll compute per-token NLL only where labels != -100.
-    out = model(input_ids=input_ids, attention_mask=attn_mask)
-    logits = out.logits
-
-    # Shift
-    logits = logits[:, :-1, :]         # predict next token
-    tgt    = labels[:, 1:]             # next-token targets
-    mask_y = (tgt != -100)
-
-    # Gather logprobs for targets
-    logp_all = F.log_softmax(logits, dim=-1)
-    tgt_safe = tgt.masked_fill(~mask_y, 0)
-    token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
-
-    # Sum only over y tokens
-    lp_sum = (token_lp * mask_y).sum(dim=1)
-    return lp_sum / len(tok)
-
-
-def kl_to_ref(student, reference, tok, x_list):
-    student.train(); reference.eval()
-    enc = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=256).to(DEVICE)
-    s_logits = student(**enc).logits
     with torch.no_grad():
-        r_logits = reference(**enc).logits
-    p = F.log_softmax(s_logits, dim=-1)
-    q = F.log_softmax(r_logits, dim=-1)
-    kl = (torch.exp(p) * (p - q)).sum(dim=-1)
-    kl = (kl * enc.attention_mask).sum() / enc.attention_mask.sum().clamp_min(1)
-    return kl
+        st_out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
+        rf_out = reference(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
 
-def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.2):
-    lp_pos = logprob_sum(student, tok, xs, y_pos)
-    lp_neg = logprob_sum(student, tok, xs, y_neg)
-    with torch.no_grad():
-        lr_pos = logprob_sum(reference, tok, xs, y_pos)
-        lr_neg = logprob_sum(reference, tok, xs, y_neg)
-    margin = (lp_pos - lp_neg) - (lr_pos - lr_neg)
-    with torch.no_grad():
-        margin_ref = (lr_pos - lr_neg)
-    margin_student = (lp_pos - lp_neg)
-    print(f"[DPO] mean margins | student: {margin_student.mean().item():.3f}  ref: {margin_ref.mean().item():.3f}")
-    return -torch.log(torch.sigmoid(beta * margin)).mean()
+    # Shift for next-token prediction
+    st_logits = st_out.logits[:, :-1, :] / temperature
+    rf_logits = rf_out.logits[:, :-1, :] / temperature
+    mask_y = (labels[:, 1:] != -100)  # positions belonging to y
+
+    # KL(student || reference) over vocab at each token
+    log_p = F.log_softmax(st_logits, dim=-1)
+    q = F.softmax(rf_logits, dim=-1)
+
+    # Per-token KL: sum over vocab, then mask to y positions
+    kl_tok = F.kl_div(log_p, q, reduction="none").sum(dim=-1)  # [B, T]
+    kl_tok = kl_tok * mask_y.float()
+    denom = mask_y.float().sum().clamp_min(1.0)
+    return kl_tok.sum() / denom
 
 # -----------------------
 # Mini probes (cheap)
@@ -604,6 +626,13 @@ def main():
     reference = AutoModelForCausalLM.from_pretrained(args.model_name).to(DEVICE)
     reference.eval()
 
+    try:
+        student = torch.compile(student, mode="reduce-overhead", fullgraph=False)
+        reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False)
+        logger.info("Enabled torch.compile for student & reference.")
+    except Exception as e:
+        logger.warning(f"torch.compile skipped: {e}")
+
     logger.info("Setting up heuristic caregiver...")
     caregiver = Caregiver()
 
@@ -657,12 +686,15 @@ def main():
         # Light nudge: append a small cue token to expose the locus (helps heuristics)
         prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
 
-        # Light nudge: append a small cue token to expose the locus (helps heuristics)
+        # Light nudge (single pass)
         prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
         
         # Generate short student attempts
         gen_start = time.time()
-        attempts = generate(student, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9)
+        # Adaptive decode budget (shorter contexts → fewer new tokens)
+        avg_len = sum(len(p.split()) for p in prefixes)/len(prefixes)
+        adaptive_new = 8 if avg_len < 10 else 12
+        attempts = generate(student, tok, prefixes, max_new_tokens=adaptive_new, temperature=0.9, top_p=0.9)
         gen_time = time.time() - gen_start
         step_times["generate"] += gen_time
 
@@ -699,7 +731,7 @@ def main():
         # --- Compute core losses first ---
         forward_start = time.time()
         L_sft = ce_targets(student, tok, prefixes, y_star)
-        L_kl  = kl_to_ref(student, reference, tok, prefixes)
+        L_kl  = kl_to_ref(student, reference, tok, prefixes, y_star)  # FIX: pass y_pos
         L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
 
         # --- DPO block (optional) ---
@@ -844,3 +876,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # # Optional: compile models (PyTorch 2.x) after first dummy forward for stable shapes
+    # try:
+    #     student = torch.compile(student, mode="reduce-overhead", fullgraph=False)
+    #     reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False)
+    #     logger.info("Enabled torch.compile for student & reference.")
+    # except Exception as e:
+    #     logger.warning(f"torch.compile skipped: {e}")
