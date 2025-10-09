@@ -13,6 +13,7 @@ from torch.utils.data import IterableDataset, DataLoader
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
+from transformers import GPT2Tokenizer, GPT2Model
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -26,6 +27,91 @@ torch.manual_seed(7)
 logger = get_logger("BabyLM-Interactive")
 
 from datasets import load_dataset, get_dataset_config_names
+
+def force_json(text: str) -> Dict:
+    # Extract first {...} block to guard against stray tokens
+    m = re.search(r'\{.*\}', text, flags=re.S)
+    if not m:
+        raise ValueError("No JSON object found in caregiver output")
+    js = json.loads(m.group(0))
+    return js
+
+@dataclass
+class CaregiverOutput:
+    corrected: str
+    tag: str
+    negative: Optional[str]
+    reason: str
+
+
+ALLOWED_TAGS = {"agreement","reflexive","npi","entity","morphology","other"}
+
+def validate_js(js: Dict) -> CaregiverOutput:
+    for k in ["corrected","tag","negative","reason"]:
+        if k not in js: raise ValueError(f"Missing key: {k}")
+    tag = js["tag"].strip().lower()
+    if tag not in ALLOWED_TAGS: tag = "other"
+    corrected = js["corrected"].strip()
+    negative  = js["negative"]
+    if isinstance(negative, str):
+        negative = negative.strip()
+        if not negative: negative = None
+    elif negative is not None:
+        negative = None
+    reason = js["reason"].strip()
+    # Basic sanity checks
+    if len(corrected.split()) > 24:  # small slack
+        corrected = " ".join(corrected.split()[:24])
+    if negative and len(negative.split()) > 24:
+        negative = " ".join(negative.split()[:24])
+    return CaregiverOutput(corrected, tag, negative, reason)
+
+class Caregiver:
+    """Very small heuristic caregiver. You can later swap to an LLM-based one."""
+    def __init__(self, rng_seed: int = 0):
+        self.tok = GPT2Tokenizer.from_pretrained('gpt2-medium')
+        self.model = GPT2Model.from_pretrained('gpt2-medium')
+
+        self.system = {
+            "role": "system",
+            "content": (
+                "You are a precise language teacher. "
+                "Given a student's short output y (≤20 tokens) for a prefix x, you must:\n"
+                "1) Provide a corrected sentence y* that preserves meaning while fixing grammar/morphology/reference issues.\n"
+                "2) Assign exactly one tag from: agreement, reflexive, npi, entity, morphology, other.\n"
+                "3) Optionally provide a minimal negative y− differing from y* by ONE targeted error; else null.\n"
+                "4) Return STRICT JSON matching the Schema. Do not include code fences or explanations.\n"
+                "Constraints: concise y* (≤20 tokens); minimal edits."
+                "Schema: {\"corrected\": \"string\", \"tag\": \"agreement|reflexive|npi|entity|morphology|other\", \"negative\": \"string|null\", \"reason\": \"string\"}"
+            )
+        }
+        self.shots = [
+            {"corrected": "The keys to the cabinet are on the table.", "tag": "agreement", "negative": "The keys to the cabinet is on the table.", "reason": "Plural subject requires 'are'."},
+            {"corrected": "John told Mary that he will go.", "tag": "entity", "negative": "John told Mary that she will go.", "reason": "Pronoun must refer to John."},
+            {"corrected": "No student has ever cheated.", "tag": "npi", "negative": "A student has ever cheated.", "reason": "'ever' needs a negative licensor."}
+        ]
+
+
+    def correct(self, prefix: str, student: str, shots: Optional[list]=None) -> CaregiverOutput:
+
+        self.user = {"role":"user","content":f"PREFIX (x): {prefix}\nSTUDENT (y): {student}\nReturn JSON as specified. No extra text."}
+
+        fewshot = []
+        if shots:
+            for ex in shots:
+                fewshot.append({"role":"assistant","content":json.dumps(ex, ensure_ascii=False)})
+
+        user = {"role":"user","content":f"PREFIX (x): {prefix}\nSTUDENT (y): {student}\nReturn JSON as specified. No extra text."}
+
+        raw = self.model([self.system, *fewshot, user], temperature=0.2, max_tokens=220)
+        js = force_json(raw)
+        out = validate_js(js)
+
+        # Extra guard: if corrected == student with no change and tag != 'other', force minimal negative to None
+        if out.corrected.strip() == student.strip() and out.tag != "other":
+            out.negative = None
+
+        return out
 
 @torch.no_grad()
 def full_logprob_sum(model, tok, x_list, y_list, max_len=256):
@@ -118,12 +204,7 @@ def pretty_print_blimp(per_cat):
 # -----------------------
 # Caregiver (heuristic); swap with LLM later
 # -----------------------
-@dataclass
-class CaregiverOutput:
-    corrected: str
-    tag: str
-    negative: Optional[str]
-    reason: str
+
 
 class HeuristicCaregiver:
     def correct(self, prefix: str, y: str) -> CaregiverOutput:
