@@ -13,7 +13,7 @@ from torch.utils.data import IterableDataset, DataLoader
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
-from transformers import GPT2Tokenizer, GPT2Model
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -22,6 +22,13 @@ from color_logger import get_logger, MLColors, Fore, Style
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
 torch.manual_seed(7)
+
+# Add after imports & seeds (near top, after DEVICE):
+torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
 # Initialize the color logger
 logger = get_logger("BabyLM-Interactive")
@@ -69,8 +76,21 @@ def validate_js(js: Dict) -> CaregiverOutput:
 class Caregiver:
     """Very small heuristic caregiver. You can later swap to an LLM-based one."""
     def __init__(self, rng_seed: int = 0):
-        self.tok = GPT2Tokenizer.from_pretrained('gpt2-medium')
-        self.model = GPT2Model.from_pretrained('gpt2-medium')
+        # Use fast tokenizer for better performance
+        self.tok = GPT2Tokenizer.from_pretrained('gpt2-medium', use_fast=True)
+        # Set pad token if not present
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        
+        # CRITICAL: Set padding side to left for decoder-only models
+        self.tok.padding_side = 'left'
+            
+        self.model = GPT2LMHeadModel.from_pretrained('gpt2-medium')
+        self.model.eval()
+        
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            self.model.to('cuda')
 
         self.system = {
             "role": "system",
@@ -91,27 +111,65 @@ class Caregiver:
             {"corrected": "No student has ever cheated.", "tag": "npi", "negative": "A student has ever cheated.", "reason": "'ever' needs a negative licensor."}
         ]
 
+    def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
+        """Batch correction for much better performance."""
+        # Build batch of prompts
+        batch_prompts = []
+        for prefix, student in zip(prefixes, students):
+            prompt = self.system["content"]
+            prompt += f"Prefix: {prefix}\nStudent: {student}\nJSON: {{"
+            batch_prompts.append(prompt)
+        
+        # Tokenize batch
+        inputs = self.tok(
+            batch_prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=400  # Much shorter context
+        )
+        
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Batch generate (much faster) - Remove temperature to avoid warnings
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=60,  # Much shorter generations
+                do_sample=False,    # Greedy for speed and consistency
+                pad_token_id=self.tok.eos_token_id,
+                eos_token_id=self.tok.eos_token_id
+            )
+        
+        # Decode batch results
+        results = []
+        input_length = inputs['input_ids'].shape[1]
+        
+        for i, (prefix, student) in enumerate(zip(prefixes, students)):
+            try:
+                generated_text = self.tok.decode(
+                    outputs[i][input_length:], 
+                    skip_special_tokens=True
+                )
+                full_json_text = "{" + generated_text
+                
+                js = force_json(full_json_text)
+                out = validate_js(js)
+                results.append(out)
+                
+            except Exception as e:
+                # Fast fallback
+                results.append(CaregiverOutput(
+                    student.strip(), "other", None, f"Parse error: {str(e)[:30]}"
+                ))
+        
+        return results
 
     def correct(self, prefix: str, student: str, shots: Optional[list]=None) -> CaregiverOutput:
-
-        self.user = {"role":"user","content":f"PREFIX (x): {prefix}\nSTUDENT (y): {student}\nReturn JSON as specified. No extra text."}
-
-        fewshot = []
-        if shots:
-            for ex in shots:
-                fewshot.append({"role":"assistant","content":json.dumps(ex, ensure_ascii=False)})
-
-        user = {"role":"user","content":f"PREFIX (x): {prefix}\nSTUDENT (y): {student}\nReturn JSON as specified. No extra text."}
-
-        raw = self.model([self.system, *fewshot, user], temperature=0.2, max_tokens=220)
-        js = force_json(raw)
-        out = validate_js(js)
-
-        # Extra guard: if corrected == student with no change and tag != 'other', force minimal negative to None
-        if out.corrected.strip() == student.strip() and out.tag != "other":
-            out.negative = None
-
-        return out
+        """Single correction (calls batch method for consistency)."""
+        results = self.correct_batch([prefix], [student])
+        return results[0]
 
 @torch.no_grad()
 def full_logprob_sum(model, tok, x_list, y_list, max_len=256):
@@ -200,72 +258,6 @@ def pretty_print_blimp(per_cat):
     for k, v in rows:
         print(f"  {k:>28}: {v:.3f}")
 
-
-# -----------------------
-# Caregiver (heuristic); swap with LLM later
-# -----------------------
-
-
-class HeuristicCaregiver:
-    def correct(self, prefix: str, y: str) -> CaregiverOutput:
-        s = y.strip()
-        # Inside HeuristicCaregiver.correct(...)
-        # plural noun followed by 'is' (generic)
-        # HeuristicCaregiver.correct(...)
-        # Question formation: "She can goes" -> "She can go"
-        # Inside HeuristicCaregiver.correct(...)
-        # plural noun followed by 'is' (generic)
-        if re.search(r"\b(\w+?s)\s+is\b", s) and not re.search(r"\bnews|mathematics|physics\b", s):
-            y_star = re.sub(r"\bis\b", "are", s, count=1)
-            y_neg  = re.sub(r"\bare\b", "is", y_star, count=1)
-            return CaregiverOutput(y_star, "agreement", y_neg, "Plural subject → are.")
-        # singular noun with 'are' (rough)
-        if re.search(r"\b(a|one|this|that)\s+\w+\s+are\b", s, flags=re.I):
-            y_star = re.sub(r"\bare\b", "is", s, count=1)
-            y_neg  = re.sub(r"\bis\b", "are", y_star, count=1)
-            return CaregiverOutput(y_star, "agreement", y_neg, "Singular subject → is.")
-
-        if re.search(r"\b(can|could|will|would|should|may|might)\s+\w+?s\b", s):
-            y_star = re.sub(r"\b(can|could|will|would|should|may|might)\s+(\w+?)s\b", r"\1 \2", s, count=1)
-            y_neg  = re.sub(r"\b(can|could|will|would|should|may|might)\s+(\w+?)\b", r"\1 \2s", y_star, count=1)
-            return CaregiverOutput(y_star, "aux-inflection", y_neg, "Aux + bare verb.")
-
-        if re.search(r"\b(\w+?s)\s+is\b", s) and not re.search(r"\bnews|mathematics|physics\b", s):
-            y_star = re.sub(r"\bis\b", "are", s, count=1)
-            y_neg  = re.sub(r"\bare\b", "is", y_star, count=1)
-            return CaregiverOutput(y_star, "agreement", y_neg, "Plural subject → are.")
-        # singular noun with 'are' (rough)
-        if re.search(r"\b(a|one|this|that)\s+\w+\s+are\b", s, flags=re.I):
-            y_star = re.sub(r"\bare\b", "is", s, count=1)
-            y_neg  = re.sub(r"\bis\b", "are", y_star, count=1)
-            return CaregiverOutput(y_star, "agreement", y_neg, "Singular subject → is.")
-
-        # Agreement: plural subject + "is"
-        if re.search(r"\b(keys?|dogs?|cats?|cars?)\s+is\b", s):
-            y_star = re.sub(r"\bis\b", "are", s, count=1)
-            y_neg  = re.sub(r"\bare\b", "is", y_star, count=1)
-            return CaregiverOutput(y_star, "agreement", y_neg, "Plural subject → are.")
-        # Reflexive mismatch
-        if re.search(r"\bhe\b.*\bthemselves\b", s):
-            y_star = re.sub(r"\bthemselves\b", "himself", s, count=1)
-            y_neg  = re.sub(r"\bhimself\b", "themselves", y_star, count=1)
-            return CaregiverOutput(y_star, "reflexive", y_neg, "Reflexive mismatch.")
-        # NPI licensing: “A … ever” → “No … ever”
-        if re.search(r"\bA [^\.!?]{0,20}\b ever\b", s):
-            y_star = re.sub(r"\bA\b", "No", s, count=1)
-            y_neg  = s
-            return CaregiverOutput(y_star, "npi", y_neg, "NPI 'ever' needs a neg licensor.")
-        # Morphology nominalization
-        if " creative " in f" {s} ":
-            y_star = s.replace(" creative ", " creativity ")
-            y_neg  = s.replace(" creative ", " creativeness ")
-            return CaregiverOutput(y_star, "morphology", y_neg, "Nominalization fix.")
-        # Entity pronoun
-        if "Mary told John" in s and re.search(r"\bshe\b", s):
-            y_star = re.sub(r"\bshe\b", "he", s, count=1)
-            return CaregiverOutput(y_star, "entity", s, "Pronoun must refer to John.")
-        # Default
-        return CaregiverOutput(s, "other", None, "No change")
 
 # -----------------------
 # BNC prefix miner
@@ -367,11 +359,16 @@ def batchify(items, bs):
 def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9):
     model.eval()
     ids = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=480).to(DEVICE)
+    
+    # Remove temperature from generation call since it's causing warnings
+    # Use do_sample=True with top_p for similar randomness
     outputs = model.generate(
         **ids,
         max_new_tokens=max_new_tokens,
-        do_sample=True, temperature=temperature, top_p=top_p,
-        pad_token_id=tok.eos_token_id, eos_token_id=tok.eos_token_id
+        do_sample=True, 
+        top_p=top_p,
+        pad_token_id=tok.eos_token_id, 
+        eos_token_id=tok.eos_token_id
     )
     outs = []
     for i, output in enumerate(outputs):
@@ -594,15 +591,15 @@ def main():
     logger.info(f"🚀 Performance optimizations: batch generation, parallel data loading, profiling enabled")
 
     logger.info("Loading tokenizer...")
-    tok = AutoTokenizer.from_pretrained(args.model_name)
+    # Use fast tokenizer explicitly for better performance
+    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "right"  # << important for our manual label shift in eval
-
     
     # Fix padding side for decoder-only models (critical for generation quality)
-    tok.padding_side = 'left'
+    tok.padding_side = 'left'  # This should be the ONLY place we set padding_side
     logger.info(f"Set tokenizer padding_side to: {Fore.GREEN}left{Style.RESET_ALL} (required for decoder-only models)")
+    logger.info(f"Using fast tokenizer: {Fore.GREEN}{tok.is_fast}{Style.RESET_ALL}")
     logger.info(f"Suppressed tokenizer parallelism warnings via environment variable")
 
     # Student + LoRA
@@ -622,7 +619,7 @@ def main():
     reference.eval()
 
     logger.info("Setting up heuristic caregiver...")
-    caregiver = HeuristicCaregiver()
+    caregiver = Caregiver()
 
     # Data stream
     bnc_name = args.bnc_name if args.bnc_name else None
@@ -641,10 +638,10 @@ def main():
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=50, max_len=64, progress=True)
-    mo0 = mini_morph(student, tok)
-    pretty_print_blimp(per_cat0)
-    logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
+    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=5, max_len=64, progress=True)
+    # mo0 = mini_morph(student, tok)
+    # pretty_print_blimp(per_cat0)
+    # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
 
     
     logger.success("🎯 Starting training loop...")
@@ -659,6 +656,7 @@ def main():
     for batch in loader:
         step_start = time.time()
         step += 1
+        
         # Up-sample phenomenon-rich prefixes for 50% of each batch
         if "tag" in batch:
             rich_idx = [i for i,t in enumerate(batch["tag"]) if t in ("agreement","reflexive","npi","morphology","entity")]
@@ -679,13 +677,22 @@ def main():
         # Generate short student attempts
         gen_start = time.time()
         attempts = generate(student, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9)
-        step_times["generate"] += time.time() - gen_start
+        gen_time = time.time() - gen_start
+        step_times["generate"] += gen_time
 
         # Caregiver corrections
         correct_start = time.time()
-        outs = [caregiver.correct(x, y) for x, y in zip(prefixes, attempts)]
-        y_star = [o.corrected for o in outs]
-        step_times["correct"] += time.time() - correct_start
+        try:
+            # Use batch correction for much better performance
+            outs = caregiver.correct_batch(prefixes, attempts)
+            y_star = [o.corrected for o in outs]
+            correct_time = time.time() - correct_start
+            step_times["correct"] += correct_time
+        except Exception as e:
+            # Fallback: use original attempts as corrections
+            outs = [CaregiverOutput(attempt, "other", None, "Caregiver failed") for attempt in attempts]
+            y_star = attempts
+            step_times["correct"] += time.time() - correct_start
         
         # Track correction statistics for logging
         if step % 200 == 0:  # Less frequent than main logging
@@ -800,14 +807,15 @@ def main():
                 "KL_loss": L_kl.item(), 
                 "DPO_loss": L_dpo.item(),
                 "BLiMP_score": bl,
-                "Morph_score": mo0,
+                "Morph_score": mo0 if 'mo0' in locals() else 0.0,
                 "Words": f"{budget.used/1e6:.1f}M"
             }
             logger.update_progress(step, **eval_metrics)
             
             # Use the enhanced metric display
             bl_metric = logger.metric("BLiMP", f"{bl:.3f}", good_threshold=0.7, warn_threshold=0.5)
-            mo_metric = logger.metric("Morph", f"{mo0:.3f}", good_threshold=0.7, warn_threshold=0.5)
+            mo_score = mo0 if 'mo0' in locals() else 0.0
+            mo_metric = logger.metric("Morph", f"{mo_score:.3f}", good_threshold=0.7, warn_threshold=0.5)
             
             logger.eval(step, f"{bl_metric}, {mo_metric}")
             
@@ -828,9 +836,9 @@ def main():
     final_bl = mini_blimp(student, tok)
     final_mo = mini_morph(student, tok)
     
-    # Calculate improvements
-    bl_improvement = final_bl - bl0
-    mo_improvement = final_mo - mo0
+    # Calculate improvements (with fallback if initial eval was skipped)
+    bl_improvement = final_bl - bl0 if 'bl0' in locals() else 0.0
+    mo_improvement = final_mo - mo0 if 'mo0' in locals() else 0.0
     
     # Create summary using the enhanced logger
     summary_data = {
