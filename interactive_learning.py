@@ -111,59 +111,45 @@ class Caregiver:
             {"corrected": "No student has ever cheated.", "tag": "npi", "negative": "A student has ever cheated.", "reason": "'ever' needs a negative licensor."}
         ]
 
+        self.system_text = self.system["content"]
+        # Pre-tokenize system prompt once (CPU tensor retained; will be moved on use)
+        self.system_ids = self.tok(self.system_text, return_tensors="pt", add_special_tokens=False)
+
+    # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
     def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
-        """Batch correction for much better performance."""
-        # Build batch of prompts
-        batch_prompts = []
-        for prefix, student in zip(prefixes, students):
-            prompt = self.system["content"]
-            prompt += f"Prefix: {prefix}\nStudent: {student}\nJSON: {{"
-            batch_prompts.append(prompt)
-        
-        # Tokenize batch
-        inputs = self.tok(
-            batch_prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=400  # Much shorter context
-        )
-        
+        batch_snippets = [
+            f"Prefix: {p}\nStudent: {s}\nJSON: {{"
+            for p, s in zip(prefixes, students)
+        ]
+        dyn = self.tok(batch_snippets, return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
+        # Concatenate system_ids + dynamic part
+        input_ids = torch.cat([self.system_ids["input_ids"].expand(dyn["input_ids"].size(0), -1), dyn["input_ids"]], dim=1)
+        attn_mask = torch.cat([torch.ones_like(self.system_ids["input_ids"]).expand(dyn["attention_mask"].size(0), -1), dyn["attention_mask"]], dim=1)
         device = next(self.model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Batch generate (much faster) - Remove temperature to avoid warnings
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=60,  # Much shorter generations
-                do_sample=False,    # Greedy for speed and consistency
+        input_ids = input_ids.to(device)
+        attn_mask = attn_mask.to(device)
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+            gen = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=48,
+                do_sample=False,
                 pad_token_id=self.tok.eos_token_id,
-                eos_token_id=self.tok.eos_token_id
+                eos_token_id=self.tok.eos_token_id,
+                use_cache=True,
             )
-        
-        # Decode batch results
+
+        # Slice only newly generated tokens
+        new_tokens = gen[:, input_ids.size(1):]
         results = []
-        input_length = inputs['input_ids'].shape[1]
-        
-        for i, (prefix, student) in enumerate(zip(prefixes, students)):
+        for i, (pfx, stu) in enumerate(zip(prefixes, students)):
             try:
-                generated_text = self.tok.decode(
-                    outputs[i][input_length:], 
-                    skip_special_tokens=True
-                )
-                full_json_text = "{" + generated_text
-                
-                js = force_json(full_json_text)
-                out = validate_js(js)
-                results.append(out)
-                
+                txt = self.tok.decode(new_tokens[i], skip_special_tokens=True)
+                js = force_json("{" + txt)
+                results.append(validate_js(js))
             except Exception as e:
-                # Fast fallback
-                results.append(CaregiverOutput(
-                    student.strip(), "other", None, f"Parse error: {str(e)[:30]}"
-                ))
-        
+                results.append(CaregiverOutput(stu.strip(), "other", None, f"Parse error: {str(e)[:24]}"))
         return results
 
     def correct(self, prefix: str, student: str, shots: Optional[list]=None) -> CaregiverOutput:
