@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
-from datasets import load_dataset, IterableDatasetDict
+from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model
 
@@ -24,6 +24,96 @@ torch.manual_seed(7)
 
 # Initialize the color logger
 logger = get_logger("BabyLM-Interactive")
+
+from datasets import load_dataset, get_dataset_config_names
+
+@torch.no_grad()
+def full_logprob_sum(model, tok, x_list, y_list, max_len=256):
+    model.eval()
+    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+
+    # labels: predict only y tokens
+    labels = input_ids.clone()
+    # mask out x part
+    labels[:, :enc_x.input_ids.shape[1]] = -100
+
+    # Causal LM predicts token t at logits[:, t-1], so shift both by one step.
+    # We’ll compute per-token NLL only where labels != -100.
+    out = model(input_ids=input_ids, attention_mask=attn_mask)
+    logits = out.logits
+
+    # Shift
+    logits = logits[:, :-1, :]         # predict next token
+    tgt    = labels[:, 1:]             # next-token targets
+    mask_y = (tgt != -100)
+
+    # Gather logprobs for targets
+    logp_all = F.log_softmax(logits, dim=-1)
+    tgt_safe = tgt.masked_fill(~mask_y, 0)
+    token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
+
+    # Sum only over y tokens
+    lp_sum = (token_lp * mask_y).sum(dim=1)
+    return lp_sum
+
+
+@torch.no_grad()
+def eval_blimp_hf(model, tok, n_per_cat=50, max_len=64, categories=None, progress=True):
+    """
+    Evaluate on real BLiMP items:
+      - loads each phenomenon split
+      - samples up to n_per_cat test items
+      - compares mean logprob of good vs bad full sentences
+    Returns: overall_acc, per_category dict
+    """
+    if categories is None:
+        categories = get_dataset_config_names("blimp")  # 67 phenomena
+
+    per_cat = {}
+    total_right, total = 0, 0
+
+    for cat in categories:
+        ds = load_dataset("blimp", cat, split="train")
+        # each example has 'sentence_good' and 'sentence_bad'
+        n = min(n_per_cat, len(ds))
+        if n == 0:
+            continue
+        # sample without replacement for speed
+        idx = torch.randperm(len(ds))[:n].tolist()
+        good = [ds[i]["sentence_good"] for i in idx]
+        bad  = [ds[i]["sentence_bad"]  for i in idx]
+
+        # batch in chunks to save memory
+        batch = 64
+        rights = 0
+        for s in range(0, n, batch):
+            g = good[s:s+batch]
+            b = bad[s:s+batch]
+            lp_g = full_logprob_sum(model, tok, g, b, max_len=max_len)
+            lp_b = full_logprob_sum(model, tok, b, b, max_len=max_len)
+            rights += (lp_g > lp_b).sum().item()
+
+        acc = rights / n
+        per_cat[cat] = acc
+        total_right += rights
+        total += n
+        if progress:
+            print(f"[BLiMP/{cat:>28}] acc={acc:.3f}  n={n}")
+
+    overall = total_right / max(total, 1)
+    return overall, per_cat
+
+def pretty_print_blimp(per_cat):
+    # quick summary by sorting hardest → easiest
+    rows = sorted(per_cat.items(), key=lambda kv: kv[1])
+    print("\n[BLiMP] per-category (hardest → easiest)")
+    for k, v in rows:
+        print(f"  {k:>28}: {v:.3f}")
+
 
 # -----------------------
 # Caregiver (heuristic); swap with LLM later
@@ -38,6 +128,37 @@ class CaregiverOutput:
 class HeuristicCaregiver:
     def correct(self, prefix: str, y: str) -> CaregiverOutput:
         s = y.strip()
+        # Inside HeuristicCaregiver.correct(...)
+        # plural noun followed by 'is' (generic)
+        # HeuristicCaregiver.correct(...)
+        # Question formation: "She can goes" -> "She can go"
+        # Inside HeuristicCaregiver.correct(...)
+        # plural noun followed by 'is' (generic)
+        if re.search(r"\b(\w+?s)\s+is\b", s) and not re.search(r"\bnews|mathematics|physics\b", s):
+            y_star = re.sub(r"\bis\b", "are", s, count=1)
+            y_neg  = re.sub(r"\bare\b", "is", y_star, count=1)
+            return CaregiverOutput(y_star, "agreement", y_neg, "Plural subject → are.")
+        # singular noun with 'are' (rough)
+        if re.search(r"\b(a|one|this|that)\s+\w+\s+are\b", s, flags=re.I):
+            y_star = re.sub(r"\bare\b", "is", s, count=1)
+            y_neg  = re.sub(r"\bis\b", "are", y_star, count=1)
+            return CaregiverOutput(y_star, "agreement", y_neg, "Singular subject → is.")
+
+        if re.search(r"\b(can|could|will|would|should|may|might)\s+\w+?s\b", s):
+            y_star = re.sub(r"\b(can|could|will|would|should|may|might)\s+(\w+?)s\b", r"\1 \2", s, count=1)
+            y_neg  = re.sub(r"\b(can|could|will|would|should|may|might)\s+(\w+?)\b", r"\1 \2s", y_star, count=1)
+            return CaregiverOutput(y_star, "aux-inflection", y_neg, "Aux + bare verb.")
+
+        if re.search(r"\b(\w+?s)\s+is\b", s) and not re.search(r"\bnews|mathematics|physics\b", s):
+            y_star = re.sub(r"\bis\b", "are", s, count=1)
+            y_neg  = re.sub(r"\bare\b", "is", y_star, count=1)
+            return CaregiverOutput(y_star, "agreement", y_neg, "Plural subject → are.")
+        # singular noun with 'are' (rough)
+        if re.search(r"\b(a|one|this|that)\s+\w+\s+are\b", s, flags=re.I):
+            y_star = re.sub(r"\bare\b", "is", s, count=1)
+            y_neg  = re.sub(r"\bis\b", "are", y_star, count=1)
+            return CaregiverOutput(y_star, "agreement", y_neg, "Singular subject → is.")
+
         # Agreement: plural subject + "is"
         if re.search(r"\b(keys?|dogs?|cats?|cars?)\s+is\b", s):
             y_star = re.sub(r"\bis\b", "are", s, count=1)
@@ -162,68 +283,75 @@ def batchify(items, bs):
         yield b
 
 @torch.no_grad()
-def generate(model, tok, prefixes: List[str], max_new_tokens=12, temperature=0.9, top_p=0.9):
+def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9):
     model.eval()
-    
-    # Batch tokenization for efficiency
-    ids = tok(prefixes, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    
-    # Batch generation
+    ids = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=480).to(DEVICE)
     outputs = model.generate(
         **ids,
         max_new_tokens=max_new_tokens,
-        do_sample=True, 
-        temperature=temperature, 
-        top_p=top_p,
-        pad_token_id=tok.eos_token_id,
-        eos_token_id=tok.eos_token_id
+        do_sample=True, temperature=temperature, top_p=top_p,
+        pad_token_id=tok.eos_token_id, eos_token_id=tok.eos_token_id
     )
-    
-    # Decode only the generated parts (skip input tokens)
     outs = []
-    input_lengths = ids["input_ids"].shape[1]
     for i, output in enumerate(outputs):
-        # Find actual input length for this sequence (accounting for padding)
         actual_input_len = (ids["input_ids"][i] != tok.pad_token_id).sum().item()
         gen_tokens = output[actual_input_len:]
-        gen_text = tok.decode(gen_tokens, skip_special_tokens=True)
-        outs.append(gen_text.strip())
-    
+        outs.append(tok.decode(gen_tokens, skip_special_tokens=True).strip())
     return outs
+
+
+MAX_CONCAT = 512  # enough for short prefixes + short corrections
 
 def ce_targets(student, tok, x_list, y_list):
     student.train()
-    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    # concat x + y; labels mask x part
+    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
     input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
     attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
     labels = input_ids.clone()
     labels[:, :enc_x.input_ids.shape[1]] = -100
-    out = student(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+    out = student(input_ids=input_ids[:, :MAX_CONCAT],
+                  attention_mask=attn_mask[:, :MAX_CONCAT],
+                  labels=labels[:, :MAX_CONCAT])
     return out.loss
 
 @torch.no_grad()
-def logprob_sum(model, tok, x_list, y_list):
+def logprob_sum(model, tok, x_list, y_list, max_len=256):
     model.eval()
-    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+
     input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
     attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+
+    # labels: predict only y tokens
     labels = input_ids.clone()
+    # mask out x part
     labels[:, :enc_x.input_ids.shape[1]] = -100
+
+    # Causal LM predicts token t at logits[:, t-1], so shift both by one step.
+    # We’ll compute per-token NLL only where labels != -100.
     out = model(input_ids=input_ids, attention_mask=attn_mask)
     logits = out.logits
-    logp = F.log_softmax(logits, dim=-1)
-    tgt = labels[:,1:].clone()
-    mask = (tgt != -100)
-    lp = logp[:,:-1,:].gather(-1, tgt.masked_fill(~mask, 0).unsqueeze(-1)).squeeze(-1)
-    lp = (lp * mask).sum(dim=1)
-    return lp
+
+    # Shift
+    logits = logits[:, :-1, :]         # predict next token
+    tgt    = labels[:, 1:]             # next-token targets
+    mask_y = (tgt != -100)
+
+    # Gather logprobs for targets
+    logp_all = F.log_softmax(logits, dim=-1)
+    tgt_safe = tgt.masked_fill(~mask_y, 0)
+    token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
+
+    # Sum only over y tokens
+    lp_sum = (token_lp * mask_y).sum(dim=1)
+    return lp_sum / len(tok)
+
 
 def kl_to_ref(student, reference, tok, x_list):
     student.train(); reference.eval()
-    enc = tok(x_list, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    enc = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=256).to(DEVICE)
     s_logits = student(**enc).logits
     with torch.no_grad():
         r_logits = reference(**enc).logits
@@ -240,6 +368,10 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.2):
         lr_pos = logprob_sum(reference, tok, xs, y_pos)
         lr_neg = logprob_sum(reference, tok, xs, y_neg)
     margin = (lp_pos - lp_neg) - (lr_pos - lr_neg)
+    with torch.no_grad():
+        margin_ref = (lr_pos - lr_neg)
+    margin_student = (lp_pos - lp_neg)
+    print(f"[DPO] mean margins | student: {margin_student.mean().item():.3f}  ref: {margin_ref.mean().item():.3f}")
     return -torch.log(torch.sigmoid(beta * margin)).mean()
 
 # -----------------------
@@ -251,6 +383,8 @@ BLIMP_MINI = [
     ("He", " saw himself.", " saw themselves."),
     ("A student", " has never cheated.", " has ever cheated."),
     ("Mary told John that", " he will go.", " she will go."),
+    ("The key to the cabinets", " is missing.", " are missing."),
+    ("Each of the boys", " is late.", " are late."),
 ]
 
 MORPH_STEMS   = ["She showed much", "His"]
@@ -262,8 +396,8 @@ def simple_logprob(model, tok, full_text):
     """Calculate logprob of full text sequence (simpler than logprob_sum)."""
     model.eval()
     # Temporarily switch to right padding for evaluation to avoid complexity
-    orig_padding_side = tok.padding_side
-    tok.padding_side = 'right'
+    # orig_padding_side = tok.padding_side
+    # tok.padding_side = 'right'
     
     try:
         enc = tok(full_text, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
@@ -286,38 +420,56 @@ def simple_logprob(model, tok, full_text):
         tok.padding_side = orig_padding_side
 
 @torch.no_grad()
-def mini_blimp(model, tok):
+def mini_blimp(model, tok, verbose=False):
+    """
+    Compare logprob of the continuation only (y) conditioned on the same prefix (x).
+    Uses padding-agnostic logprob_sum to avoid any left/right padding mismatch.
+    """
+    model.eval()
     correct = 0
-    total = len(BLIMP_MINI)
-    
+    totals = len(BLIMP_MINI)
+    details = []
+
     for prefix, good, bad in BLIMP_MINI:
-        good_text = prefix + good
-        bad_text = prefix + bad
-        
-        lp_good = simple_logprob(model, tok, [good_text])
-        lp_bad = simple_logprob(model, tok, [bad_text])
-        
-        if lp_good[0] > lp_bad[0]:
-            correct += 1
-    
-    return correct / total
+        lp_g = logprob_sum(model, tok, [prefix], [good])  # log P(y_good | x)
+        lp_b = logprob_sum(model, tok, [prefix], [bad])   # log P(y_bad  | x)
+        ok = (lp_g[0] > lp_b[0])
+        correct += int(ok)
+        if verbose:
+            details.append((prefix, float(lp_g[0].item()), float(lp_b[0].item()), float((lp_g - lp_b)[0].item()), ok))
+
+    if verbose:
+        print("\n[mini_blimp details]")
+        for p, g, b, m, ok in details:
+            print(f"  {('✓' if ok else '✗')} margin={m:.2f}  good={g:.2f}  bad={b:.2f}  |  x='{p}'")
+
+    return correct / totals
 
 @torch.no_grad()
-def mini_morph(model, tok):
+def mini_morph(model, tok, verbose=False):
+    """
+    Same idea: score continuation y given the stem x.
+    """
+    model.eval()
     correct = 0
-    total = len(MORPH_STEMS)
-    
-    for i, stem in enumerate(MORPH_STEMS):
-        good_text = stem + MORPH_GOOD[i]
-        bad_text = stem + MORPH_BAD[i]
-        
-        lp_good = simple_logprob(model, tok, [good_text])
-        lp_bad = simple_logprob(model, tok, [bad_text])
-        
-        if lp_good[0] > lp_bad[0]:
-            correct += 1
-    
-    return correct / total
+    totals = len(MORPH_STEMS)
+    details = []
+
+    for stem, good, bad in zip(MORPH_STEMS, MORPH_GOOD, MORPH_BAD):
+        lp_g = logprob_sum(model, tok, [stem], [good])
+        lp_b = logprob_sum(model, tok, [stem], [bad])
+        ok = (lp_g[0] > lp_b[0])
+        correct += int(ok)
+        if verbose:
+            details.append((stem, float(lp_g[0].item()), float(lp_b[0].item()), float((lp_g - lp_b)[0].item()), ok))
+
+    if verbose:
+        print("\n[mini_morph details]")
+        for p, g, b, m, ok in details:
+            print(f"  {('✓' if ok else '✗')} margin={m:.2f}  good={g:.2f}  bad={b:.2f}  |  x='{p}'")
+
+    return correct / totals
+
 
 # -----------------------
 # Word budget
@@ -364,6 +516,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.padding_side = "right"  # << important for our manual label shift in eval
+
     
     # Fix padding side for decoder-only models (critical for generation quality)
     tok.padding_side = 'left'
@@ -405,11 +559,12 @@ def main():
     budget = WordBudget(100_000_000)
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
-    # Initial eval
-    logger.info("Running initial evaluation...")
-    bl0 = mini_blimp(student, tok)
+    logger.info("Running initial evaluation on REAL BLiMP…")
+    bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=50, max_len=64, progress=True)
     mo0 = mini_morph(student, tok)
-    logger.eval(0, f"Initial scores - BLiMP: {Fore.YELLOW}{bl0:.3f}{Style.RESET_ALL}, Morph: {Fore.YELLOW}{mo0:.3f}{Style.RESET_ALL}")
+    pretty_print_blimp(per_cat0)
+    logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
+
     
     logger.success("🎯 Starting training loop...")
     logger.info(f"📊 Progress will be tracked with {'tqdm' if hasattr(logger, 'progress_bar') else 'basic'} progress bars")
@@ -423,8 +578,22 @@ def main():
     for batch in loader:
         step_start = time.time()
         step += 1
-        prefixes = batch["prefix"]
-        step_times["data"] += time.time() - step_start
+        # Up-sample phenomenon-rich prefixes for 50% of each batch
+        if "tag" in batch:
+            rich_idx = [i for i,t in enumerate(batch["tag"]) if t in ("agreement","reflexive","npi","morphology","entity")]
+            if len(rich_idx) >= args.batch_size // 2:
+                sel = rich_idx[:args.batch_size//2] + list(range(args.batch_size//2))
+                prefixes = [batch["prefix"][i] for i in sel]
+            else:
+                prefixes = batch["prefix"]
+        else:
+            prefixes = batch["prefix"]
+
+        # Light nudge: append a small cue token to expose the locus (helps heuristics)
+        prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
+
+        # Light nudge: append a small cue token to expose the locus (helps heuristics)
+        prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
         
         # Generate short student attempts
         gen_start = time.time()
@@ -453,20 +622,41 @@ def main():
                 if corrections_msg:
                     logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
 
-        # Losses
+        # --- Compute core losses first ---
         forward_start = time.time()
         L_sft = ce_targets(student, tok, prefixes, y_star)
         L_kl  = kl_to_ref(student, reference, tok, prefixes)
-        L_dpo = torch.tensor(0.0, device=DEVICE)
+        L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
+
+        # --- DPO block (optional) ---
         if args.use_dpo:
             xs_dpo, yp, yn = [], [], []
-            for x,o in zip(prefixes, outs):
-                if o.negative:
-                    xs_dpo.append(x); yp.append(o.corrected); yn.append(o.negative)
-            if xs_dpo:
-                L_dpo = dpo_loss(student, reference, tok, xs_dpo, yp, yn, beta=0.2)
+            for x, o in zip(prefixes, outs):
+                if not o.negative:
+                    continue
+                # filter by reference preference (only strong contrastive pairs)
+                lp_pos_ref = logprob_sum(reference, tok, [x], [o.corrected])[0]
+                lp_neg_ref = logprob_sum(reference, tok, [x], [o.negative])[0]
+                if (lp_pos_ref - lp_neg_ref).item() < 0.5:
+                    continue
+                xs_dpo.append(x)
+                yp.append(o.corrected)
+                yn.append(o.negative)
 
-        loss = L_sft + 0.03*L_kl + 0.5*L_dpo
+            if xs_dpo:
+                L_dpo = dpo_loss(student, reference, tok, xs_dpo, yp, yn, beta=2.0)
+
+        step_times["forward"] += time.time() - forward_start
+
+        # --- Combine losses (final total) ---
+        dpo_weight = 1.0 if args.use_dpo else 0.0
+        loss = L_sft + 0.03 * L_kl + dpo_weight * L_dpo
+
+
+
+        # weight DPO more heavily once we filter for high-confidence pairs
+        dpo_weight = 1.0 if args.use_dpo else 0.0
+        loss = L_sft + 0.03 * L_kl + dpo_weight * L_dpo
         step_times["forward"] += time.time() - forward_start
 
         backward_start = time.time()
@@ -518,9 +708,10 @@ def main():
 
         # Evaluation and checkpointing
         if step % args.eval_every == 0:
-            logger.info("🔍 Running evaluation...")
-            bl = mini_blimp(student, tok)
-            mo = mini_morph(student, tok)
+            logger.info("🔍 Running BLiMP (real) evaluation…")
+            bl, per_cat = eval_blimp_hf(student, tok, n_per_cat=200, max_len=64, progress=False)
+            logger.eval(step, f"BLiMP (real): {bl:.3f}")
+
             
             # Update progress bar with evaluation metrics
             eval_metrics = {
@@ -528,14 +719,14 @@ def main():
                 "KL_loss": L_kl.item(), 
                 "DPO_loss": L_dpo.item(),
                 "BLiMP_score": bl,
-                "Morph_score": mo,
+                "Morph_score": mo0,
                 "Words": f"{budget.used/1e6:.1f}M"
             }
             logger.update_progress(step, **eval_metrics)
             
             # Use the enhanced metric display
             bl_metric = logger.metric("BLiMP", f"{bl:.3f}", good_threshold=0.7, warn_threshold=0.5)
-            mo_metric = logger.metric("Morph", f"{mo:.3f}", good_threshold=0.7, warn_threshold=0.5)
+            mo_metric = logger.metric("Morph", f"{mo0:.3f}", good_threshold=0.7, warn_threshold=0.5)
             
             logger.eval(step, f"{bl_metric}, {mo_metric}")
             
