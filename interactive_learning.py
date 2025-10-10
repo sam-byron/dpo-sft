@@ -57,6 +57,23 @@ except Exception as e:
 
 from datasets import load_dataset, get_dataset_config_names
 
+@torch.no_grad()
+def get_uncertainty(student, tok, prefixes, attempts):
+    """Return per-sample uncertainty (entropy) as selection criterion."""
+    student.eval()
+    enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    enc_y = tok(attempts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+    
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
+    
+    logits = out.logits[:, enc_x.input_ids.shape[1]-1:-1, :]
+    probs = F.softmax(logits, dim=-1)
+    entropy = -(probs * probs.log()).sum(dim=-1).mean(dim=-1)
+    return entropy.cpu().tolist()
+
 def force_json(text: str) -> Dict:
     # Extract first {...} block to guard against stray tokens
     m = re.search(r'\{.*\}', text, flags=re.S)
@@ -759,20 +776,46 @@ def main():
         gen_time = time.time() - gen_start
         step_times["generate"] += gen_time
 
-        # Caregiver corrections
+        # NEW: Calculate uncertainty and select samples for correction
         correct_start = time.time()
-        try:
-            # Use batch correction for much better performance
-            outs = caregiver.correct_batch(prefixes, attempts)
-            y_star = [o.corrected for o in outs]
-            correct_time = time.time() - correct_start
-            step_times["correct"] += correct_time
-        except Exception as e:
-            # Fallback: use original attempts as corrections
-            outs = [CaregiverOutput(attempt, "other", None, "Caregiver failed") for attempt in attempts]
-            y_star = attempts
-            step_times["correct"] += time.time() - correct_start
+        uncertainties = get_uncertainty(student, tok, prefixes, attempts)
         
+        # Correct top 30% most uncertain samples
+        threshold = sorted(uncertainties, reverse=True)[int(0.3 * len(uncertainties))]
+        needs_correction = [u >= threshold for u in uncertainties]
+        n_correct = sum(needs_correction)
+        
+        # Only invoke caregiver for flagged samples
+        if n_correct > 0:
+            # Extract samples needing correction
+            idxs_to_correct = [i for i, flag in enumerate(needs_correction) if flag]
+            prefixes_subset = [prefixes[i] for i in idxs_to_correct]
+            attempts_subset = [attempts[i] for i in idxs_to_correct]
+            
+            # Invoke caregiver only on subset
+            try:
+                outs_subset = caregiver.correct_batch(prefixes_subset, attempts_subset)
+                
+                # Merge back: corrected samples + unchanged samples
+                outs = []
+                correct_iter = iter(outs_subset)
+                for i, flag in enumerate(needs_correction):
+                    if flag:
+                        outs.append(next(correct_iter))
+                    else:
+                        # Keep student's original output
+                        outs.append(CaregiverOutput(attempts[i], "other", None, "no_correction"))
+            except Exception as e:
+                logger.warning(f"⚠️  Caregiver batch failed: {e}")
+                outs = [CaregiverOutput(att, "other", None, "caregiver_error") for att in attempts]
+        else:
+            # No samples need correction
+            outs = [CaregiverOutput(att, "other", None, "no_correction") for att in attempts]
+        
+        y_star = [o.corrected for o in outs]
+        correct_time = time.time() - correct_start
+        step_times["correct"] += correct_time
+
         # Track correction statistics for logging
         if step % 200 == 0:  # Less frequent than main logging
             tag_counts = {}
@@ -992,3 +1035,4 @@ if __name__ == "__main__":
     #     logger.info("Enabled torch.compile for student & reference.")
     # except Exception as e:
     #     logger.warning(f"torch.compile skipped: {e}")
+
