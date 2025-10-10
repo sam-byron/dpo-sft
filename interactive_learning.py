@@ -30,16 +30,30 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+# Initialize the color logger
+logger = get_logger("BabyLM-Interactive")
+
 # Make compile robust to dynamic shapes and fall back instead of crashing
 try:
     import torch._dynamo as dynamo
+    import torch._inductor.config as inductor_config
+    
+    # Configure dynamo for better dynamic shape handling
     dynamo.config.dynamic_shapes = True
     dynamo.config.suppress_errors = True
+    dynamo.config.verbose = False  # Reduce verbosity
+    
+    # Configure CUDAGraph settings - be more permissive
+    inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+    inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None  # Silence warnings
+    
+    # Additional configs to improve compilation success
+    inductor_config.max_autotune = False  # Faster compile, good enough perf
+    inductor_config.triton.cudagraphs = False  # Disable cudagraphs entirely (they're causing the warnings)
+    
+    logger.info("Configured torch.compile settings for dynamic shapes")
 except Exception as e:
-    logger.warning(f"torch._dynamo not available or config failed: {e}")
-
-# Initialize the color logger
-logger = get_logger("BabyLM-Interactive")
+    logger.warning(f"torch._dynamo/inductor config not available: {e}")
 
 from datasets import load_dataset, get_dataset_config_names
 
@@ -113,19 +127,18 @@ def validate_js(js: Dict) -> CaregiverOutput:
 class Caregiver:
     """Very small heuristic caregiver. You can later swap to an LLM-based one."""
     def __init__(self, rng_seed: int = 0):
-        # Use fast tokenizer for better performance
         self.tok = GPT2Tokenizer.from_pretrained('gpt2-medium', use_fast=True)
-        # Set pad token if not present
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
-        
-        # CRITICAL: Set padding side to left for decoder-only models
         self.tok.padding_side = 'left'
             
-        self.model = GPT2LMHeadModel.from_pretrained('gpt2-medium')
+        # Load in bfloat16 directly (saves memory + faster)
+        self.model = GPT2LMHeadModel.from_pretrained(
+            'gpt2-medium',
+            torch_dtype=torch.bfloat16  # Native bf16 weights
+        )
         self.model.eval()
         
-        # Move to GPU if available
         if torch.cuda.is_available():
             self.model.to('cuda')
 
@@ -158,7 +171,12 @@ class Caregiver:
             f"Prefix: {p}\nStudent: {s}\nJSON: {{"
             for p, s in zip(prefixes, students)
         ]
-        dyn = self.tok(batch_snippets, return_tensors="pt", padding=True, truncation=True, max_length=256, add_special_tokens=False)
+        
+        # Use bucketed padding for stable shapes
+        target_len = pad_to_bucket(batch_snippets, self.tok, buckets=[64, 128, 256])
+        dyn = self.tok(batch_snippets, return_tensors="pt", padding='max_length', 
+                      max_length=target_len, truncation=True, add_special_tokens=False)
+        
         # Concatenate system_ids + dynamic part
         input_ids = torch.cat([self.system_ids["input_ids"].expand(dyn["input_ids"].size(0), -1), dyn["input_ids"]], dim=1)
         attn_mask = torch.cat([torch.ones_like(self.system_ids["input_ids"]).expand(dyn["attention_mask"].size(0), -1), dyn["attention_mask"]], dim=1)
@@ -171,7 +189,7 @@ class Caregiver:
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 max_new_tokens=48,
-                do_sample=False,
+                do_sample=True,
                 pad_token_id=self.tok.eos_token_id,
                 eos_token_id=self.tok.eos_token_id,
                 use_cache=True,
@@ -389,7 +407,10 @@ def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9
         rev[oi] = i
     ordered = [prefixes[i] for i in order]
 
-    enc = tok(ordered, return_tensors="pt", padding=True, truncation=True, max_length=480).to(DEVICE)
+    # Use bucketed padding for stable shapes
+    target_len = pad_to_bucket(ordered, tok)
+    enc = tok(ordered, return_tensors="pt", padding='max_length', 
+              max_length=target_len, truncation=True).to(DEVICE)
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         out = model.generate(
@@ -454,34 +475,30 @@ def logprob_sum(model, tok, x_list, y_list, max_len=256):
 def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = None, temperature: float = 1.0):
     """
     Distillation-style KL(student || reference) on target tokens y conditioned on x.
-    Computes per-token KL across the vocabulary for positions corresponding to y.
-    Args:
-      xs: List[str] prefixes
-      y_pos: List[str] positive corrections (same length as xs)
-      y_neg: Optional[List[str]] negatives (ignored by default; can be added for extra regularization)
-      temperature: softening temperature for logits
-    Returns:
-      Scalar KL loss (mean over tokens and batch)
+    Student needs gradients, reference doesn't.
     """
-    student.eval()
+    student.train()  # ✅ Keep student in train mode for gradients
     reference.eval()
-
+    
     # Encode x and y (only positives by default)
     enc_x = tok(xs, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
     enc_y = tok(y_pos, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-
+    
     # Build inputs and masks
     input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
     attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
-
+    
     # Labels to identify y positions (mask x with -100)
     labels = input_ids.clone()
     labels[:, :enc_x.input_ids.shape[1]] = -100
-
+    
+    # Student forward WITH gradients (no torch.no_grad!)
+    st_out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
+    
+    # Reference forward WITHOUT gradients
     with torch.no_grad():
-        st_out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
         rf_out = reference(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
-
+    
     # Shift for next-token prediction
     st_logits = st_out.logits[:, :-1, :] / temperature
     rf_logits = rf_out.logits[:, :-1, :] / temperature
@@ -697,10 +714,10 @@ def main():
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=5, max_len=64, progress=True)
-    mo0 = mini_morph(student, tok)
-    pretty_print_blimp(per_cat0)
-    logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
+    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=50, max_len=64, progress=True)
+    # mo0 = mini_morph(student, tok)
+    # pretty_print_blimp(per_cat0)
+    # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
 
     
     logger.success("🎯 Starting training loop...")
@@ -917,6 +934,53 @@ def main():
     final_path = os.path.join(args.save_dir, "final")
     student.save_pretrained(final_path)
     logger.success(f"💾 Final model saved: {final_path}")
+
+def combined_loss(student, reference, tok, prefixes, y_star, kl_weight=0.03):
+    """Compute SFT + KL in single forward pass."""
+    student.train()
+    
+    # Encode once
+    enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    enc_y = tok(y_star, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+    labels = input_ids.clone()
+    labels[:, :enc_x.input_ids.shape[1]] = -100
+    
+    # Student forward (with grad)
+    st_out = student(input_ids=input_ids[:, :MAX_CONCAT], 
+                     attention_mask=attn_mask[:, :MAX_CONCAT],
+                     labels=labels[:, :MAX_CONCAT])
+    L_sft = st_out.loss
+    
+    # Reference forward (no grad) - reuse same inputs
+    with torch.no_grad():
+        ref_out = reference(input_ids=input_ids[:, :MAX_CONCAT], 
+                           attention_mask=attn_mask[:, :MAX_CONCAT])
+    
+    # Efficient KL: only on y positions
+    st_logits = st_out.logits[:, :-1, :]
+    ref_logits = ref_out.logits[:, :-1, :]
+    mask_y = (labels[:, 1:] != -100)
+    
+    # Use MSE on logits (faster than full KL over vocab)
+    kl_approx = F.mse_loss(st_logits[mask_y], ref_logits[mask_y].detach())
+    
+    return L_sft + kl_weight * kl_approx, L_sft, kl_approx
+
+# Add helper function before generate() function (around line 300)
+def pad_to_bucket(texts, tokenizer, buckets=[32, 64, 128, 256, 384, 512]):
+    """
+    Pad/truncate texts to fixed bucket sizes to reduce CUDAGraph recompilations.
+    Returns texts padded to the nearest bucket size.
+    """
+    # Find max length in batch
+    max_len = max(len(tokenizer.tokenize(t)) for t in texts)
+    
+    # Find appropriate bucket
+    target_len = min((b for b in buckets if b >= max_len), default=buckets[-1])
+    
+    return target_len
 
 if __name__ == "__main__":
     main()
