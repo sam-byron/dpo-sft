@@ -30,6 +30,14 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+# Make compile robust to dynamic shapes and fall back instead of crashing
+try:
+    import torch._dynamo as dynamo
+    dynamo.config.dynamic_shapes = True
+    dynamo.config.suppress_errors = True
+except Exception as e:
+    logger.warning(f"torch._dynamo not available or config failed: {e}")
+
 # Initialize the color logger
 logger = get_logger("BabyLM-Interactive")
 
@@ -42,6 +50,35 @@ def force_json(text: str) -> Dict:
         raise ValueError("No JSON object found in caregiver output")
     js = json.loads(m.group(0))
     return js
+
+def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
+    """
+    Direct Preference Optimization (Rafailov et al. 2023):
+      L = - E[ log σ( β ( log πθ(y+|x) - log πθ(y-|x) - (log πref(y+|x) - log πref(y-|x)) ) ) ]
+    We approximate log π(y|x) with sum of token log-probs over y conditioned on x.
+    Args:
+      xs, y_pos, y_neg: lists of strings (same length)
+      beta: temperature (larger -> more aggressive)
+    Returns: scalar loss
+    """
+    student.train()
+    with torch.no_grad():
+        # Reference preferences (detach)
+        lp_pos_ref = logprob_sum(reference, tok, xs, y_pos, max_len=max_len)  # [B]
+        lp_neg_ref = logprob_sum(reference, tok, xs, y_neg, max_len=max_len)  # [B]
+        ref_delta = lp_pos_ref - lp_neg_ref                                  # [B]
+
+    # Student preferences (requires grad)
+    lp_pos_stu = logprob_sum(student, tok, xs, y_pos, max_len=max_len)       # [B]
+    lp_neg_stu = logprob_sum(student, tok, xs, y_neg, max_len=max_len)       # [B]
+    stu_delta  = lp_pos_stu - lp_neg_stu
+
+    # Score and logistic loss
+    margin = beta * (stu_delta - ref_delta)
+    # log σ(z) = -softplus(-z)  ; we want -E[log σ(margin)]
+    loss = F.softplus(-margin).mean()
+    return loss
+
 
 @dataclass
 class CaregiverOutput:
@@ -626,15 +663,21 @@ def main():
     reference = AutoModelForCausalLM.from_pretrained(args.model_name).to(DEVICE)
     reference.eval()
 
+    # Do NOT compile student (training graph + LoRA + dynamic shapes → unstable)
+    # Only compile eval-time models with safe fallbacks
     try:
-        student = torch.compile(student, mode="reduce-overhead", fullgraph=False)
-        reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False)
-        logger.info("Enabled torch.compile for student & reference.")
+        reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False, dynamic=True)
+        logger.info("Enabled torch.compile for reference.")
     except Exception as e:
-        logger.warning(f"torch.compile skipped: {e}")
+        logger.warning(f"torch.compile (reference) skipped: {e}")
 
     logger.info("Setting up heuristic caregiver...")
     caregiver = Caregiver()
+    try:
+        caregiver.model = torch.compile(caregiver.model, mode="reduce-overhead", fullgraph=False, dynamic=True)
+        logger.info("Enabled torch.compile for caregiver model.")
+    except Exception as e:
+        logger.warning(f"torch.compile (caregiver) skipped: {e}")
 
     # Data stream
     bnc_name = args.bnc_name if args.bnc_name else None
@@ -642,7 +685,8 @@ def main():
     logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
     ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
     # Reduce workers to avoid tokenizer parallelism issues with streaming datasets
-    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
+    # Add drop_last=True to stabilize batch shape for compiled graphs
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0, pin_memory=True, drop_last=True)
 
     # Optim & sched
     logger.info("Setting up optimizer and scheduler...")
@@ -653,10 +697,10 @@ def main():
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=5, max_len=64, progress=True)
-    # mo0 = mini_morph(student, tok)
-    # pretty_print_blimp(per_cat0)
-    # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
+    bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=5, max_len=64, progress=True)
+    mo0 = mini_morph(student, tok)
+    pretty_print_blimp(per_cat0)
+    logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
 
     
     logger.success("🎯 Starting training loop...")
@@ -743,8 +787,8 @@ def main():
                 # filter by reference preference (only strong contrastive pairs)
                 lp_pos_ref = logprob_sum(reference, tok, [x], [o.corrected])[0]
                 lp_neg_ref = logprob_sum(reference, tok, [x], [o.negative])[0]
-                if (lp_pos_ref - lp_neg_ref).item() < 0.5:
-                    continue
+                # if (lp_pos_ref - lp_neg_ref).item() < 0.5:
+                #     continue
                 xs_dpo.append(x)
                 yp.append(o.corrected)
                 yn.append(o.negative)
