@@ -775,9 +775,9 @@ def main():
         attempts = generate(student, tok, prefixes, max_new_tokens=adaptive_new, temperature=0.9, top_p=0.9)
         gen_time = time.time() - gen_start
         step_times["generate"] += gen_time
-
+        
         # NEW: Calculate uncertainty and select samples for correction
-        correct_start = time.time()
+        correct_start = time.time()  # ✅ Add this line
         uncertainties = get_uncertainty(student, tok, prefixes, attempts)
         
         # Correct top 30% most uncertain samples
@@ -835,7 +835,7 @@ def main():
         # --- Compute core losses first ---
         forward_start = time.time()
         L_sft = ce_targets(student, tok, prefixes, y_star)
-        L_kl  = kl_to_ref(student, reference, tok, prefixes, y_star)  # FIX: pass y_pos
+        L_kl  = kl_to_ref(student, reference, tok, prefixes, attempts)  # ✅ Use attempts, not y_star
         L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
 
         # --- DPO block (optional) ---
