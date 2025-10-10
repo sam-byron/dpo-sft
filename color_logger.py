@@ -59,7 +59,7 @@ class TrainingProgressBar:
             self.pbar = tqdm(
                 total=total_steps,
                 desc=f"{Fore.BLUE}{desc}{Style.RESET_ALL}",
-                ncols=100,
+                ncols=150,  # ✅ Increased from 100 to 150 to fit all metrics
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}',
                 colour='blue'
             )

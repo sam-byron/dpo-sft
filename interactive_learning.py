@@ -882,13 +882,17 @@ def main():
             logger.warning("⚠️  Reached 100M word limit. Stopping training.")
             break
 
-        # Update progress bar with current metrics
+        # Update progress bar with current metrics (ensure all losses are shown)
         current_lr = sched.get_last_lr()[0]
+        
+        # Use dictionary method for progress bar updates
         progress_metrics = {
-            "SFT_loss": L_sft.item(),
-            "KL_loss": L_kl.item(), 
-            "DPO_loss": L_dpo.item(),
+            "Loss": f"{loss.item():.3f}",
+            "SFT": f"{L_sft.item():.3f}",
+            "KL": f"{L_kl.item():.3f}", 
+            "DPO": f"{L_dpo.item():.3f}",
             "LR": f"{current_lr:.1e}",
+            "Corr": f"{n_correct}/{len(prefixes)}",
             "Words": f"{budget.used/1e6:.1f}M"
         }
         logger.update_progress(step, **progress_metrics)
@@ -896,11 +900,20 @@ def main():
         # Detailed logging every 100 steps (less frequent than progress bar)
         if step % 100 == 0:
             # Use the enhanced loss display from the logger
-            losses = {"SFT": L_sft.item(), "KL": L_kl.item(), "DPO": L_dpo.item()}
-            thresholds = {"SFT": (2.0, 3.0), "KL": (0.1, 0.5), "DPO": (1.0, 2.0)}
+            losses = {"Total": loss.item(), "SFT": L_sft.item(), "KL": L_kl.item(), "DPO": L_dpo.item()}
+            thresholds = {"Total": (2.5, 4.0), "SFT": (2.0, 3.0), "KL": (0.1, 0.5), "DPO": (1.0, 2.0)}
             
             loss_display = logger.loss_display(losses, thresholds)
-            extra_info = f"LR: {Fore.CYAN}{current_lr:.2e}{Style.RESET_ALL} | 📚 {Fore.CYAN}{budget.used/1e6:.1f}M{Style.RESET_ALL} words"
+            
+            # Calculate correction rate for display
+            correction_rate = n_correct / len(prefixes)
+            corr_color = Fore.GREEN if correction_rate < 0.3 else Fore.YELLOW if correction_rate < 0.5 else Fore.RED
+            
+            extra_info = (
+                f"LR: {Fore.CYAN}{current_lr:.2e}{Style.RESET_ALL} | "
+                f"📚 {Fore.CYAN}{budget.used/1e6:.1f}M{Style.RESET_ALL} words | "
+                f"🎯 Corr: {corr_color}{correction_rate:.1%}{Style.RESET_ALL} ({n_correct}/{len(prefixes)})"
+            )
             
             # Performance breakdown
             total_time = sum(step_times.values())
