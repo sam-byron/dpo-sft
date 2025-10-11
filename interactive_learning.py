@@ -475,10 +475,14 @@ def logprob_sum(model, tok, x_list, y_list, max_len=256):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
         enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
-        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
-        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+        
+        # Ensure input_ids are Long (not Float) - critical fix!
+        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long()
+        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long()
+        
         labels = input_ids.clone()
         labels[:, :enc_x.input_ids.shape[1]] = -100
+        
         out = model(input_ids=input_ids, attention_mask=attn_mask)
         logits = out.logits[:, :-1]
         tgt = labels[:, 1:]
@@ -691,27 +695,29 @@ def main():
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in student.parameters())
     logger.info(f"Trainable parameters: {Fore.GREEN}{trainable_params:,}{Style.RESET_ALL} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
-
+    import copy
     # Reference (frozen)
     logger.info("Loading reference model...")
-    reference = AutoModelForCausalLM.from_pretrained(args.model_name).to(DEVICE)
+    reference = copy.deepcopy(student)
+    reference.requires_grad_(False)
+    reference.to(DEVICE)
     reference.eval()
 
     # Do NOT compile student (training graph + LoRA + dynamic shapes → unstable)
     # Only compile eval-time models with safe fallbacks
-    try:
-        reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        logger.info("Enabled torch.compile for reference.")
-    except Exception as e:
-        logger.warning(f"torch.compile (reference) skipped: {e}")
+    # try:
+    #     reference = torch.compile(reference, mode="reduce-overhead", fullgraph=False, dynamic=True)
+    #     logger.info("Enabled torch.compile for reference.")
+    # except Exception as e:
+    #     logger.warning(f"torch.compile (reference) skipped: {e}")
 
     logger.info("Setting up heuristic caregiver...")
     caregiver = Caregiver()
-    try:
-        caregiver.model = torch.compile(caregiver.model, mode="reduce-overhead", fullgraph=False, dynamic=True)
-        logger.info("Enabled torch.compile for caregiver model.")
-    except Exception as e:
-        logger.warning(f"torch.compile (caregiver) skipped: {e}")
+    # try:
+    #     caregiver.model = torch.compile(caregiver.model, mode="reduce-overhead", fullgraph=False, dynamic=True)
+    #     logger.info("Enabled torch.compile for caregiver model.")
+    # except Exception as e:
+    #     logger.warning(f"torch.compile (caregiver) skipped: {e}")
 
     # Data stream
     bnc_name = args.bnc_name if args.bnc_name else None
@@ -731,7 +737,7 @@ def main():
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=50, max_len=64, progress=True)
+    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=200, max_len=64, progress=True)
     # mo0 = mini_morph(student, tok)
     # pretty_print_blimp(per_cat0)
     # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
