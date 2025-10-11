@@ -241,8 +241,8 @@ def main():
         correct_start = time.time()
         uncertainties = get_uncertainty(student, tok, prefixes, attempts)
 
-        # Correct top 30% most uncertain samples
-        threshold = sorted(uncertainties, reverse=True)[int(0.3 * len(uncertainties))]
+        # Correct top 20% most uncertain samples
+        threshold = sorted(uncertainties, reverse=True)[int(0.2 * len(uncertainties))]
         needs_correction = [u >= threshold for u in uncertainties]
         n_correct = sum(needs_correction)
 
@@ -296,21 +296,21 @@ def main():
         correct_time = time.time() - correct_start
         step_times["correct"] += correct_time
 
-        # Track correction statistics for logging
-        if step % 200 == 0:  # Less frequent than main logging
-            tag_counts = {}
-            for o in outs:
-                tag_counts[o.tag] = tag_counts.get(o.tag, 0) + 1
+        # # Track correction statistics for logging
+        # if step % 200 == 0:  # Less frequent than main logging
+        #     tag_counts = {}
+        #     for o in outs:
+        #         tag_counts[o.tag] = tag_counts.get(o.tag, 0) + 1
             
-            if any(tag != "other" for tag in tag_counts):
-                corrections_msg = []
-                for tag, count in sorted(tag_counts.items()):
-                    if tag != "other" and count > 0:
-                        color = Fore.GREEN if tag in ["agreement", "reflexive"] else Fore.CYAN
-                        corrections_msg.append(f"{color}{tag}: {count}{Style.RESET_ALL}")
+        #     if any(tag != "other" for tag in tag_counts):
+        #         corrections_msg = []
+        #         for tag, count in sorted(tag_counts.items()):
+        #             if tag != "other" and count > 0:
+        #                 color = Fore.GREEN if tag in ["agreement", "reflexive"] else Fore.CYAN
+        #                 corrections_msg.append(f"{color}{tag}: {count}{Style.RESET_ALL}")
                 
-                if corrections_msg:
-                    logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
+        #         if corrections_msg:
+        #             logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
 
         # --- Compute core losses first ---
         forward_start = time.time()
@@ -327,8 +327,8 @@ def main():
                 # filter by reference preference (only strong contrastive pairs)
                 lp_pos_ref = logprob_sum(reference, tok, [x], [o.corrected])[0]
                 lp_neg_ref = logprob_sum(reference, tok, [x], [o.negative])[0]
-                # if (lp_pos_ref - lp_neg_ref).item() < 0.5:
-                #     continue
+                if (lp_pos_ref - lp_neg_ref).item() < 0.1:
+                    continue
                 xs_dpo.append(x)
                 yp.append(o.corrected)
                 yn.append(o.negative)

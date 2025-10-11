@@ -1,4 +1,3 @@
-
 import os, re, math, random, json, argparse, itertools, time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, cast
@@ -99,82 +98,99 @@ class CaregiverOutput:
 
 ALLOWED_TAGS = {"agreement","reflexive","npi","entity","morphology","other"}
 
-def validate_js(js: Dict) -> CaregiverOutput:
-    for k in ["corrected","tag","negative","reason"]:
-        if k not in js: raise ValueError(f"Missing key: {k}")
-    tag = js["tag"].strip().lower()
-    if tag not in ALLOWED_TAGS: tag = "other"
-    corrected = js["corrected"].strip()
-    negative  = js["negative"]
-    if isinstance(negative, str):
-        negative = negative.strip()
-        if not negative: negative = None
-    elif negative is not None:
-        negative = None
-    reason = js["reason"].strip()
-    # Basic sanity checks
-    if len(corrected.split()) > 24:  # small slack
-        corrected = " ".join(corrected.split()[:24])
-    if negative and len(negative.split()) > 24:
-        negative = " ".join(negative.split()[:24])
+def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
+    """
+    Parse caregiver output from simple text format.
+    Expected format (pipe-delimited):
+    CORRECTED: <text>
+    TAG: <tag>
+    NEGATIVE: <text or NONE>
+    REASON: <text>
+    
+    Falls back gracefully if format is malformed.
+    """
+    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+    
+    corrected = student_fallback
+    tag = "other"
+    negative = None
+    reason = "No specific correction needed"
+    
+    for line in lines:
+        if line.startswith("CORRECTED:"):
+            corrected = line[10:].strip()
+        elif line.startswith("TAG:"):
+            raw_tag = line[4:].strip().lower()
+            if raw_tag in ALLOWED_TAGS:
+                tag = raw_tag
+        elif line.startswith("NEGATIVE:"):
+            neg_text = line[9:].strip()
+            if neg_text and neg_text.upper() != "NONE":
+                negative = neg_text
+        elif line.startswith("REASON:"):
+            reason = line[7:].strip()
+    
+    # Sanity check lengths
+    if len(corrected.split()) > 30:
+        corrected = " ".join(corrected.split()[:30])
+    if negative and len(negative.split()) > 30:
+        negative = " ".join(negative.split()[:30])
+    
     return CaregiverOutput(corrected, tag, negative, reason)
 
+
 class Caregiver:
-    """Very small heuristic caregiver. You can later swap to an LLM-based one."""
-    def __init__(self, rng_seed: int = 0):
-        self.tok = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct', use_fast=True)
+    """Caregiver model that provides text-based corrections without JSON."""
+    def __init__(self, model_name: str = 'Qwen/Qwen2.5-1.5B-Instruct', rng_seed: int = 0):
+        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = 'left'
             
-        # Load in bfloat16 directly (saves memory + faster)
+        # Load in bfloat16 directly
         self.model = AutoModelForCausalLM.from_pretrained(
-            'Qwen/Qwen2.5-1.5B-Instruct',
-            torch_dtype=torch.bfloat16  # Native bf16 weights
+            model_name,
+            torch_dtype=torch.bfloat16
         )
         self.model.eval()
         
         if torch.cuda.is_available():
             self.model = self.model.to('cuda')  # type: ignore[call-arg]
 
-        self.system = {
-            "role": "system",
-            "content": (
-                "You are a precise language teacher. "
-                "Given a student's short output y (≤20 tokens) for a prefix x, you must:\n"
-                "1) Provide a corrected sentence y* that preserves meaning while fixing grammar/morphology/reference issues.\n"
-                "2) Assign exactly one tag from: agreement, reflexive, npi, entity, morphology, other.\n"
-                "3) Optionally provide a minimal negative y− differing from y* by ONE targeted error; else null.\n"
-                "4) Return STRICT JSON matching the Schema. Do not include code fences or explanations.\n"
-                "Constraints: concise y* (≤20 tokens); minimal edits."
-                "Schema: {\"corrected\": \"string\", \"tag\": \"agreement|reflexive|npi|entity|morphology|other\", \"negative\": \"string|null\", \"reason\": \"string\"}"
-            )
-        }
-        self.shots = [
-            {"corrected": "The keys to the cabinet are on the table.", "tag": "agreement", "negative": "The keys to the cabinet is on the table.", "reason": "Plural subject requires 'are'."},
-            {"corrected": "John told Mary that he will go.", "tag": "entity", "negative": "John told Mary that she will go.", "reason": "Pronoun must refer to John."},
-            {"corrected": "No student has ever cheated.", "tag": "npi", "negative": "A student has ever cheated.", "reason": "'ever' needs a negative licensor."}
-        ]
-
-        self.system_text = self.system["content"]
-        # Pre-tokenize system prompt once (CPU tensor retained; will be moved on use)
+        self.system_text = (
+            "You are a precise language teacher. "
+            "Given a student's output, provide corrections in this exact format:\n\n"
+            "CORRECTED: <corrected text>\n"
+            "TAG: <one of: agreement, reflexive, npi, entity, morphology, other>\n"
+            "NEGATIVE: <wrong alternative or NONE>\n"
+            "REASON: <brief explanation>\n\n"
+            "Keep all text concise (≤20 tokens per field)."
+        )
+        # Pre-tokenize system prompt
         self.system_ids = self.tok(self.system_text, return_tensors="pt", add_special_tokens=False)
 
     # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
     def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
         batch_snippets = [
-            f"Prefix: {p}\nStudent: {s}\nJSON: {{"
+            f"Prefix: {p}\nStudent: {s}\n\n"
             for p, s in zip(prefixes, students)
         ]
         
-        # Use bucketed padding for stable shapes
+        # Bucketed padding
         target_len = pad_to_bucket(batch_snippets, self.tok, buckets=[64, 128, 256])
         dyn = self.tok(batch_snippets, return_tensors="pt", padding='max_length', 
                       max_length=target_len, truncation=True, add_special_tokens=False)
         
-        # Concatenate system_ids + dynamic part
-        input_ids = torch.cat([self.system_ids["input_ids"].expand(dyn["input_ids"].size(0), -1), dyn["input_ids"]], dim=1)
-        attn_mask = torch.cat([torch.ones_like(self.system_ids["input_ids"]).expand(dyn["attention_mask"].size(0), -1), dyn["attention_mask"]], dim=1)
+        # Concatenate system + dynamic
+        input_ids = torch.cat([
+            self.system_ids["input_ids"].expand(dyn["input_ids"].size(0), -1), 
+            dyn["input_ids"]
+        ], dim=1)
+        attn_mask = torch.cat([
+            torch.ones_like(self.system_ids["input_ids"]).expand(dyn["attention_mask"].size(0), -1), 
+            dyn["attention_mask"]
+        ], dim=1)
+        
         device = next(self.model.parameters()).device
         input_ids = input_ids.to(device)
         attn_mask = attn_mask.to(device)
@@ -183,27 +199,23 @@ class Caregiver:
             gen = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attn_mask,
-                max_new_tokens=48,
-                do_sample=True,
+                max_new_tokens=64,  # Slightly more room for text format
                 pad_token_id=self.tok.eos_token_id,
                 eos_token_id=self.tok.eos_token_id,
                 use_cache=True,
             )
 
-        # Slice only newly generated tokens
+        # Decode new tokens
         new_tokens = gen[:, input_ids.size(1):]
         results = []
         for i, (pfx, stu) in enumerate(zip(prefixes, students)):
-            try:
-                txt = self.tok.decode(new_tokens[i], skip_special_tokens=True)
-                js = force_json("{" + txt)
-                results.append(validate_js(js))
-            except Exception as e:
-                results.append(CaregiverOutput(stu.strip(), "other", None, f"Parse error: {str(e)[:24]}"))
+            txt = self.tok.decode(new_tokens[i], skip_special_tokens=True)
+            results.append(parse_caregiver_text(txt, stu.strip()))
+        
         return results
 
-    def correct(self, prefix: str, student: str, shots: Optional[list]=None) -> CaregiverOutput:
-        """Single correction (calls batch method for consistency)."""
+    def correct(self, prefix: str, student: str) -> CaregiverOutput:
+        """Single correction."""
         results = self.correct_batch([prefix], [student])
         return results[0]
 
@@ -344,7 +356,7 @@ def batchify(items, bs):
         yield b
 
 @torch.no_grad()
-def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9):
+def generate(model, tok, prefixes, max_new_tokens=12, temperature:Optional[float]=None, top_p:Optional[float]=None):
     model.eval()
     # Sort by length to reduce padding (then unsort)
     lengths = [len(p.split()) for p in prefixes]
@@ -360,11 +372,22 @@ def generate(model, tok, prefixes, max_new_tokens=12, temperature=0.9, top_p=0.9
               max_length=target_len, truncation=True).to(DEVICE)
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        out = model.generate(
+        
+        if temperature is not None or top_p is not None:
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature if temperature is not None else 1.0,
+                top_p=top_p if top_p is not None else 1.0,
+                pad_token_id=tok.eos_token_id,
+                eos_token_id=tok.eos_token_id,
+                use_cache=True,
+            )
+        else:
+            out = model.generate(
             **enc,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            top_p=top_p,
             pad_token_id=tok.eos_token_id,
             eos_token_id=tok.eos_token_id,
             use_cache=True,
