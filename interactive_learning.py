@@ -18,6 +18,8 @@ from peft import LoraConfig, get_peft_model
 
 # Import the color logger
 from color_logger import get_logger, MLColors, Fore, Style
+# BLiMP evaluation utilities
+from blimp import run_subset, ensure_subsets_list, pick_split
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
@@ -230,91 +232,36 @@ class Caregiver:
         return results[0]
 
 @torch.no_grad()
-def full_logprob_sum(model, tok, x_list, y_list, max_len=256):
-    model.eval()
-    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
-    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
-
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
-
-    # labels: predict only y tokens
-    labels = input_ids.clone()
-    # mask out x part
-    labels[:, :enc_x.input_ids.shape[1]] = -100
-
-    # Causal LM predicts token t at logits[:, t-1], so shift both by one step.
-    # We’ll compute per-token NLL only where labels != -100.
-    out = model(input_ids=input_ids, attention_mask=attn_mask)
-    logits = out.logits
-
-    # Shift
-    logits = logits[:, :-1, :]         # predict next token
-    tgt    = labels[:, 1:]             # next-token targets
-    mask_y = (tgt != -100)
-
-    # Gather logprobs for targets
-    logp_all = F.log_softmax(logits, dim=-1)
-    tgt_safe = tgt.masked_fill(~mask_y, 0)
-    token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
-
-    # Sum only over y tokens
-    lp_sum = (token_lp * mask_y).sum(dim=1)
-    return lp_sum
-
-
-@torch.no_grad()
 def eval_blimp_hf(model, tok, n_per_cat=50, max_len=64, categories=None, progress=True):
-    """
-    Evaluate on real BLiMP items:
-      - loads each phenomenon split
-      - samples up to n_per_cat test items
-      - compares mean logprob of good vs bad full sentences
-    Returns: overall_acc, per_category dict
-    """
-    if categories is None:
-        categories = get_dataset_config_names("blimp")  # 67 phenomena
+    """Evaluate on BLiMP using shared helpers from blimp.py.
 
-    per_cat = {}
-    total_right, total = 0, 0
+    Returns (overall_accuracy, per_category_acc_dict).
+    """
+    device = torch.device(DEVICE)
+    if categories is None:
+        categories = ensure_subsets_list("blimp")
+
+    per_cat: Dict[str, float] = {}
+    total_n = 0
+    total_right = 0.0
 
     for cat in categories:
-        ds = load_dataset("blimp", cat, split="train")
-        # each example has 'sentence_good' and 'sentence_bad'
-        n = min(n_per_cat, len(ds))
-        if n == 0:
+        try:
+            split = pick_split("blimp", cat, "auto")
+        except Exception as e:
+            if progress:
+                print(f"[BLiMP/{cat}] skipped: {e}")
             continue
-        # sample without replacement for speed
-        idx = torch.randperm(len(ds))[:n].tolist()
-        good = [ds[i]["sentence_good"] for i in idx]
-        bad  = [ds[i]["sentence_bad"]  for i in idx]
-
-        # batch in chunks to save memory
-        batch = 64
-        rights = 0
-        for s in range(0, n, batch):
-            g = good[s:s+batch]
-            b = bad[s:s+batch]
-            lp_g = full_logprob_sum(model, tok, g, b, max_len=max_len)
-            lp_b = full_logprob_sum(model, tok, b, b, max_len=max_len)
-            rights += (lp_g > lp_b).sum().item()
-
-        acc = rights / n
-        per_cat[cat] = acc
-        total_right += rights
-        total += n
+        res = run_subset(model, tok, cat, split, device, n_per_cat, normalize="none", dump=0)
+        per_cat[cat] = float(res.get("acc", 0.0))
+        n = int(res.get("n", 0))
+        total_n += n
+        total_right += per_cat[cat] * n
         if progress:
-            print(f"[BLiMP/{cat:>28}] acc={acc:.3f}  n={n}")
+            print(f"[BLiMP/{cat:>28}] acc={per_cat[cat]:.3f}  n={n}")
 
-    overall = total_right / max(total, 1)
+    overall = (total_right / max(1, total_n)) if total_n > 0 else 0.0
     return overall, per_cat
-
-def pretty_print_blimp(per_cat):
-    # quick summary by sorting hardest → easiest
-    rows = sorted(per_cat.items(), key=lambda kv: kv[1])
-    print("\n[BLiMP] per-category (hardest → easiest)")
-    for k, v in rows:
-        print(f"  {k:>28}: {v:.3f}")
 
 
 # -----------------------
