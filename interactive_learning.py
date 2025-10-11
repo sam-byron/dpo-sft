@@ -205,6 +205,9 @@ def main():
     step = 0
     step_times = {"data": 0.0, "generate": 0.0, "correct": 0.0, "forward": 0.0, "backward": 0.0}
     
+    # Caregiver audit: log corrections every 25 steps
+    audit_path = os.path.join(args.save_dir, "caregiver_audit.json")
+    
     for batch in loader:
         step_start = time.time()
         step += 1
@@ -253,6 +256,25 @@ def main():
             # Invoke caregiver only on subset
             try:
                 outs_subset = caregiver.correct_batch(prefixes_subset, attempts_subset)
+                
+                # Audit caregiver corrections every 25 steps
+                if step % 25 == 0:
+                    audit_records = []
+                    for idx, o_sub in zip(idxs_to_correct, outs_subset):
+                        audit_records.append({
+                            "step": int(step),
+                            "prefix": str(prefixes[idx]),
+                            "student": str(attempts[idx]),
+                            "caregiver_corrected": str(o_sub.corrected),
+                            "tag": str(o_sub.tag),
+                            "reason": str(o_sub.reason),
+                            "negative": (str(o_sub.negative) if o_sub.negative is not None else None),
+                        })
+                    
+                    # Append to audit file
+                    with open(audit_path, "a", encoding="utf-8") as f:
+                        for rec in audit_records:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 
                 # Merge back: corrected samples + unchanged samples
                 outs = []
