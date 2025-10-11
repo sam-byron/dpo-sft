@@ -164,7 +164,7 @@ def main():
     # except Exception as e:
     #     logger.warning(f"torch.compile (reference) skipped: {e}")
 
-    logger.info("Setting up heuristic caregiver...")
+    logger.info("Setting up caregiver...")
     caregiver = Caregiver()
     # try:
     #     caregiver.model = torch.compile(caregiver.model, mode="reduce-overhead", fullgraph=False, dynamic=True)

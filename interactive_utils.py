@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from datasets import load_dataset
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -121,14 +122,14 @@ def validate_js(js: Dict) -> CaregiverOutput:
 class Caregiver:
     """Very small heuristic caregiver. You can later swap to an LLM-based one."""
     def __init__(self, rng_seed: int = 0):
-        self.tok = GPT2Tokenizer.from_pretrained('gpt2-medium', use_fast=True)
+        self.tok = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct', use_fast=True)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = 'left'
             
         # Load in bfloat16 directly (saves memory + faster)
-        self.model = GPT2LMHeadModel.from_pretrained(
-            'gpt2-medium',
+        self.model = AutoModelForCausalLM.from_pretrained(
+            'Qwen/Qwen2.5-1.5B-Instruct',
             torch_dtype=torch.bfloat16  # Native bf16 weights
         )
         self.model.eval()
