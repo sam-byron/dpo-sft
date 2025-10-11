@@ -1,7 +1,7 @@
 
 import os, re, math, random, json, argparse, itertools, time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, cast
 
 # Suppress tokenizer parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -134,7 +134,7 @@ class Caregiver:
         self.model.eval()
         
         if torch.cuda.is_available():
-            self.model.to('cuda')
+            self.model = self.model.to('cuda')  # type: ignore[call-arg]
 
         self.system = {
             "role": "system",
@@ -300,7 +300,9 @@ class BNCPrefixStream(Dataset):
         self.items.append({"prefix": prefix, "tag": tag})
 
     def _collect_hf(self):
-        ds = load_dataset(self.bnc_name, split="train")  # materialized dataset
+        # self.bnc_name is guaranteed non-None when this is called
+        name = cast(str, self.bnc_name)
+        ds = load_dataset(name, split="train")  # materialized dataset
         for ex in ds:
             text = (ex.get("text") if isinstance(ex, dict) else None) or (
                 ex.get("content") if isinstance(ex, dict) else None
@@ -313,7 +315,9 @@ class BNCPrefixStream(Dataset):
                     return
 
     def _collect_dir(self):
-        for root, _, files in os.walk(self.bnc_dir):
+        # self.bnc_dir is guaranteed non-None when this is called
+        dir_path = cast(str, self.bnc_dir)
+        for root, _, files in os.walk(dir_path):
             for f in files:
                 if not f.lower().endswith(".txt"):
                     continue
@@ -488,6 +492,26 @@ def simple_logprob(model, tok, full_text):
 
 @torch.no_grad()
 def mini_morph(model, tok, verbose=False):
+    # Minimal morphology probe pairs
+    global MORPH_STEMS, MORPH_GOOD, MORPH_BAD
+    MORPH_STEMS = [
+        "The key",
+        "The keys",
+        "She",
+        "They",
+    ]
+    MORPH_GOOD = [
+        " is on the table.",
+        " are on the table.",
+        " is happy.",
+        " are happy.",
+    ]
+    MORPH_BAD = [
+        " are on the table.",
+        " is on the table.",
+        " are happy.",
+        " is happy.",
+    ]
     """
     Same idea: score continuation y given the stem x.
     """
