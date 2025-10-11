@@ -24,6 +24,8 @@ from blimp import run_subset, ensure_subsets_list, pick_split
 
 from interactive_utils import Caregiver, CaregiverOutput, BNCPrefixStream, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
 
+from prepare_data import prepare_data
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
 torch.manual_seed(7)
@@ -77,6 +79,7 @@ def main():
     ap.add_argument("--use_dpo", action="store_true")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--save_dir", type=str, default="./ckpts_bnc_interactive")
+    ap.add_argument("--config_path", type=str, required=True, help="Path to the configuration file")
     args = ap.parse_args()
 
     # Defaults for initial eval placeholders to satisfy static analyzers
@@ -176,7 +179,12 @@ def main():
     bnc_name = args.bnc_name if args.bnc_name else None
     bnc_dir  = args.bnc_dir if args.bnc_dir else None
     logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
-    ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
+    # ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
+    with open(args.config_path, "r") as config_file:
+        config = json.load(config_file)
+    ds = prepare_data(
+        config, config["cache_path"]
+    )
     # Reduce workers to avoid tokenizer parallelism issues with streaming datasets
     # Add drop_last=True to stabilize batch shape for compiled graphs
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=4, pin_memory=True, drop_last=True, shuffle=True)
