@@ -240,7 +240,7 @@ def run_subset(model, tok, subset: str, split: str, device: torch.device, limit:
     Returns a dict with fields: subset, split, n, acc, oov_rate, normalize, examples.
     """
     ds = load_dataset("blimp", subset, split=split)
-    n = max(limit, len(ds)) if limit > 0 else len(ds)
+    n = min(limit, len(ds)) if limit > 0 else len(ds)
     wins = 0
     total = 0
     oov_tokens = 0
