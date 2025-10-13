@@ -292,7 +292,7 @@ def main():
         gen_start = time.time()
         attempts = generate(student, tok, prefixes, temperature=0.9, top_p=0.9)
         # Ensure strings for downstream typing (guard lints)
-        attempts = [a if isinstance(a, str) else "" for a in attempts]
+        # attempts = [a if isinstance(a, str) else "" for a in attempts]
         gen_time = time.time() - gen_start
         step_times["generate"] += gen_time
         

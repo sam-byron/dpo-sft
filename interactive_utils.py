@@ -38,10 +38,11 @@ PHENOMENON_PATTERNS = {
 def get_uncertainty(student, tok, prefixes, attempts):
     """Return per-sample uncertainty (entropy) as selection criterion."""
     student.eval()
-    enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-    enc_y = tok(attempts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+    enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+    enc_y = tok(attempts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+    # Ensure input_ids and attention_mask are long tensors before moving to device
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
     
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
@@ -163,7 +164,7 @@ class Caregiver:
             generated_ids = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=10,
+            max_new_tokens=20,
             eos_token_id=self.tok.eos_token_id,
             pad_token_id=self.tok.pad_token_id,
             do_sample=True,
@@ -235,65 +236,44 @@ def batchify(items, bs):
         yield b
 
 @torch.no_grad()
-def generate(model, tok, prefixes, max_new_tokens=120, temperature:Optional[float]=None, top_p:Optional[float]=None):
+def generate(model, tok, prefixes, max_new_tokens=120, temperature: Optional[float]=None, top_p: Optional[float]=None):
     model.eval()
-    # Set left padding for generation
     orig_padding_side = tok.padding_side
     tok.padding_side = 'left'
-    # Sort by length to reduce padding (then unsort)
-    lengths = [len(p.split()) for p in prefixes]
-    order = sorted(range(len(prefixes)), key=lambda i: lengths[i])
-    rev = [0]*len(order)
-    for i, oi in enumerate(order):
-        rev[oi] = i
-    ordered = [prefixes[i] for i in order]
-
-    # Use bucketed padding for stable shapes
-    target_len = pad_to_bucket(ordered, tok)
-    tok.padding_side = 'left'
-    enc = tok(ordered, return_tensors="pt", padding='max_length', 
-              max_length=max_new_tokens, truncation=False).to(DEVICE)
-
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        
+    try:
+        target_len = pad_to_bucket(prefixes, tok)
+        enc = tok(prefixes, return_tensors="pt", padding='max_length',
+                  max_length=target_len, truncation=False).to(DEVICE)
+        gen_kwargs = dict(max_new_tokens=max_new_tokens,
+                          pad_token_id=tok.eos_token_id,
+                          eos_token_id=tok.eos_token_id,
+                          use_cache=True)
         if temperature is not None or top_p is not None:
-            out = model.generate(
-                **enc,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature if temperature is not None else 1.0,
-                top_p=top_p if top_p is not None else 1.0,
-                pad_token_id=tok.eos_token_id,
-                eos_token_id=tok.eos_token_id,
-                use_cache=True,
-            )
-        else:
-            out = model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tok.eos_token_id,
-            eos_token_id=tok.eos_token_id,
-            use_cache=True,
-        )
-    # Compute actual lengths once
-    input_lens = enc["attention_mask"].sum(dim=1).tolist()
-    gens = []
-    for i, seq in enumerate(out):
-        gen_part = seq[input_lens[i]:]
-        gens.append(tok.decode(gen_part, skip_special_tokens=True).strip())
+            gen_kwargs.update(do_sample=True,
+                              temperature=temperature if temperature is not None else 1.0,
+                              top_p=top_p if top_p is not None else 1.0)
+        out = model.generate(**enc, **gen_kwargs)
 
-    # Unsort
-    restored = [None]*len(gens)
-    for i, gi in enumerate(gens):
-        restored[order[i]] = gi
-    return restored
+        # continuation via attention_mask length (works with left padding)
+        input_lens = enc["attention_mask"].sum(dim=1).tolist()
+        continuations = []
+        for i, seq in enumerate(out):
+            cont_ids = seq[input_lens[i]:]
+            continuations.append(tok.decode(cont_ids, skip_special_tokens=True))
+
+        # return concatenated attempts
+        attempts = [p + c for p, c in zip(prefixes, continuations)]
+        return attempts
+    finally:
+        tok.padding_side = orig_padding_side
 
 def ce_targets(student, tok, x_list, y_list):
     student.train()
-    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+    enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+    enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+    # Ensure input_ids and attention_mask are long tensors
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).to(DEVICE).long()
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).to(DEVICE).long()
     labels = input_ids.clone()
     labels[:, :enc_x.input_ids.shape[1]] = -100
     out = student(input_ids=input_ids[:, :MAX_CONCAT],
@@ -338,9 +318,9 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     enc_x = tok(xs, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
     enc_y = tok(y_pos, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
     
-    # Build inputs and masks
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1)
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1)
+    # Build inputs and masks - ensure Long dtype
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long()
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long()
     
     # Labels to identify y positions (mask x with -100)
     labels = input_ids.clone()
