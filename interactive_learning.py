@@ -25,7 +25,7 @@ from blimp import run_subset, ensure_subsets_list, pick_split
 
 from interactive_utils import Caregiver, CaregiverOutput, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
 
-from prepare_data import prepare_data
+from prepare_data import prepare_data, load_or_prepare_dataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
@@ -206,42 +206,10 @@ def main():
     bnc_name = args.bnc_name if args.bnc_name else None
     bnc_dir  = args.bnc_dir if args.bnc_dir else None
     logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
-    # ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
-    # Build/load dataset and save to disk for reuse
-
-    # Build/load dataset with pickle caching
-    ds_save_path = config.get(
-        "dataset_save_path",
-        os.path.join(config.get("cache_path", "."), "prepared_dataset.pkl")
-    )
     
-    # Create directory only if ds_save_path has a parent directory
-    ds_dir = os.path.dirname(ds_save_path)
-    if ds_dir:
-        os.makedirs(ds_dir, exist_ok=True)
+    # Load or prepare dataset (simplified)
+    ds = load_or_prepare_dataset(config, logger)
     
-    if os.path.isfile(ds_save_path):
-        try:
-            with open(ds_save_path, "rb") as f:
-                ds = pickle.load(f)
-            logger.info(f"Loaded dataset from disk: {ds_save_path}")
-        except Exception as e:
-            logger.warning(f"Failed to load dataset at {ds_save_path}: {e}. Rebuilding…")
-            ds = prepare_data(config)
-            try:
-                with open(ds_save_path, "wb") as f:
-                    pickle.dump(ds, f)
-                logger.info(f"Saved dataset to disk: {ds_save_path}")
-            except Exception as e2:
-                logger.warning(f"Failed to save dataset: {e2}")
-    else:
-        ds = prepare_data(config)
-        try:
-            with open(ds_save_path, "wb") as f:
-                pickle.dump(ds, f)
-            logger.info(f"Saved dataset to disk: {ds_save_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save dataset: {e}")
     def identity_collate_fn(batch):
         """
         Identity collate function - returns batch as-is without any processing.
