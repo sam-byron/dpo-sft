@@ -1,5 +1,6 @@
 # bnc_interactive_train.py
 import os, re, math, random, json, argparse, itertools, time
+import pickle  # Add this import
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup, DataCollatorForLanguageModeling, AutoConfig
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from peft import LoraConfig, get_peft_model, PeftModel
 from load_lora import load_and_merge_lora, load_adapter_config
@@ -22,7 +23,7 @@ from color_logger import get_logger, MLColors, Fore, Style
 # BLiMP evaluation utilities
 from blimp import run_subset, ensure_subsets_list, pick_split
 
-from interactive_utils import Caregiver, CaregiverOutput, BNCPrefixStream, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
+from interactive_utils import Caregiver, CaregiverOutput, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
 
 from prepare_data import prepare_data
 
@@ -64,6 +65,12 @@ logger = get_logger("BabyLM-Interactive")
 
 from datasets import load_dataset, get_dataset_config_names
 
+def build_model(model_name="gpt2"):
+    config = AutoConfig.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_config(config)
+
+    return model
+
 # -----------------------
 # Main training
 # -----------------------
@@ -82,6 +89,9 @@ def main():
     ap.add_argument("--config_path", type=str, required=True, help="Path to the configuration file")
     args = ap.parse_args()
 
+    with open(args.config_path, "r") as config_file:
+        config = json.load(config_file)
+
     # Defaults for initial eval placeholders to satisfy static analyzers
     bl0 = 0.0
     mo0 = 0.0
@@ -99,26 +109,39 @@ def main():
     logger.info(f"🚀 Performance optimizations: batch generation, parallel data loading, profiling enabled")
 
     # Model/tokenizer loading
+    checkpoint_path = os.path.join(config["cache_path"], "checkpoint")
     if args.model_path:
         logger.info(f"Loading base + LoRA (adapters trainable only) from: {Fore.CYAN}{args.model_path}{Style.RESET_ALL}")
         # Discover base model from adapter config, else fall back to --model_name
-        base_model_name = args.model_name
         try:
-            cfg = load_adapter_config(os.path.join(args.model_path, "adapter_config.json"))
-            base_model_name = cfg.get("base_model_name_or_path", base_model_name)
-        except Exception as e:
-            logger.warning(f"Could not read adapter_config.json: {e}; falling back to --model_name={base_model_name}")
+            student = build_model()
+            weights_path = os.path.join(args.model_path, "pytorch_model.bin")
+            if os.path.isfile(weights_path):
+                state_dict = torch.load(weights_path, map_location="cpu")
+                missing, unexpected = student.load_state_dict(state_dict, strict=False)
+                student.to(DEVICE)
+                logger.info(
+                    f"Loaded model weights only (missing={len(missing)}, unexpected={len(unexpected)})."
+                )
+        except Exception as ee:
+            logger.error(f"Model-only weight restore failed: {ee}")
 
         # Tokenizer
-        tok = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        tok.padding_side = 'left'
-
-        # Base + attach adapters without merging
-        base = AutoModelForCausalLM.from_pretrained(base_model_name)
-        student = PeftModel.from_pretrained(base, args.model_path)
-        student.to(DEVICE)
+        # Enforce tokenizer model_max_length from config (fallback to max_position_embeddings, then 512)
+        tkn_max_len = int(config.get("model_max_length", config.get("max_position_embeddings", 512)))
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.get("tokenizer_path", "./model_babylm_gpt2_16k"),
+            model_max_length=tkn_max_len,
+        )
+        # Explicitly set (some fast tokenizers ignore constructor kwarg)
+        try:
+            tokenizer.model_max_length = tkn_max_len
+        except Exception:
+            pass
+        print(f"Tokenizer model_max_length set to {getattr(tokenizer, 'model_max_length', 'N/A')}")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
 
         # Freeze base weights; train only LoRA adapter params
         for n, p in student.named_parameters():
@@ -142,16 +165,20 @@ def main():
         logger.info(f"Suppressed tokenizer parallelism warnings via environment variable")
 
         # Student + LoRA (fresh init)
-        logger.info("Setting up student model with LoRA...")
-        base = AutoModelForCausalLM.from_pretrained(args.model_name)
-        lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["c_attn","c_proj","q_proj","v_proj","k_proj","o_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
-        student = get_peft_model(base, lora_cfg).to(DEVICE)
+        logger.info("Setting up student model...")
+        # base = AutoModelForCausalLM.from_pretrained(args.model_name)
+        # lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["c_attn","c_proj","q_proj","v_proj","k_proj","o_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
+        # student = get_peft_model(base, lora_cfg).to(DEVICE)
+        model_config = AutoConfig.from_pretrained(args.model_name)
+        student = AutoModelForCausalLM.from_config(model_config)
+        student.to(DEVICE)
         student.train()
     
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in student.parameters())
     logger.info(f"Trainable parameters: {Fore.GREEN}{trainable_params:,}{Style.RESET_ALL} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
     import copy
+    from datasets import load_from_disk
     # Reference (frozen)
     logger.info("Loading reference model...")
     reference = copy.deepcopy(student)
@@ -180,14 +207,83 @@ def main():
     bnc_dir  = args.bnc_dir if args.bnc_dir else None
     logger.info(f"Setting up data stream from: {bnc_name or bnc_dir or 'default'}")
     # ds = BNCPrefixStream(tok, bnc_name, bnc_dir)
-    with open(args.config_path, "r") as config_file:
-        config = json.load(config_file)
-    ds = prepare_data(
-        config, config["cache_path"]
+    # Build/load dataset and save to disk for reuse
+
+    # Build/load dataset with pickle caching
+    ds_save_path = config.get(
+        "dataset_save_path",
+        os.path.join(config.get("cache_path", "."), "prepared_dataset.pkl")
     )
+    
+    # Create directory only if ds_save_path has a parent directory
+    ds_dir = os.path.dirname(ds_save_path)
+    if ds_dir:
+        os.makedirs(ds_dir, exist_ok=True)
+    
+    if os.path.isfile(ds_save_path):
+        try:
+            with open(ds_save_path, "rb") as f:
+                ds = pickle.load(f)
+            logger.info(f"Loaded dataset from disk: {ds_save_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load dataset at {ds_save_path}: {e}. Rebuilding…")
+            ds = prepare_data(config)
+            try:
+                with open(ds_save_path, "wb") as f:
+                    pickle.dump(ds, f)
+                logger.info(f"Saved dataset to disk: {ds_save_path}")
+            except Exception as e2:
+                logger.warning(f"Failed to save dataset: {e2}")
+    else:
+        ds = prepare_data(config)
+        try:
+            with open(ds_save_path, "wb") as f:
+                pickle.dump(ds, f)
+            logger.info(f"Saved dataset to disk: {ds_save_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save dataset: {e}")
+    def identity_collate_fn(batch):
+        """
+        Identity collate function - returns batch as-is without any processing.
+        Just passes through whatever the dataset returns.
+        """
+        return batch
+    
+    def sentence_batch_collate_fn(batch):
+        """
+        Collate function that flattens all sentences from all dataset items
+        into individual batch elements. Each sentence becomes one training example.
+        
+        Input: batch = [list1, list2, list3, list4] where each list contains sentences
+        Output: [sent1, sent2, sent3, sent4, sent5, sent6, ...] (flattened)
+        
+        Example:
+        - Item 0: ["Sentence A", "Sentence B", "Sentence C"] 
+        - Item 1: ["Sentence D", "Sentence E"]
+        - Item 2: ["Sentence F"]
+        - Item 3: ["Sentence G", "Sentence H"]
+        Result: ["Sentence A", "Sentence B", "Sentence C", "Sentence D", "Sentence E", "Sentence F", "Sentence G", "Sentence H"]
+        """
+        all_sentences = []
+        
+        for item in batch:
+            if isinstance(item, list):
+                # Each item is a list of sentences - add all to batch
+                all_sentences.extend(item)
+            elif isinstance(item, str):
+                # Single string - add directly
+                all_sentences.append(item)
+            else:
+                # Fallback - convert to string
+                all_sentences.append(str(item))
+        
+        # Filter out empty sentences
+        all_sentences = [s.strip() for s in all_sentences if s.strip()]
+        
+        return all_sentences
     # Reduce workers to avoid tokenizer parallelism issues with streaming datasets
     # Add drop_last=True to stabilize batch shape for compiled graphs
-    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=4, pin_memory=True, drop_last=True, shuffle=True)
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=4, pin_memory=True, drop_last=True, shuffle=True, collate_fn=sentence_batch_collate_fn)
 
     # Optim & sched
     logger.info("Setting up optimizer and scheduler...")
@@ -198,9 +294,8 @@ def main():
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=200, max_len=64, progress=True)
-    # mo0 = mini_morph(student, tok)
-    # pretty_print_blimp(per_cat0)
+    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=100, max_len=64, progress=True)
+    # # mo0 = mini_morph(student, tok)
     # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
 
     
@@ -220,26 +315,14 @@ def main():
         step_start = time.time()
         step += 1
         
-        # Up-sample phenomenon-rich prefixes for 50% of each batch
-        if "tag" in batch:
-            rich_idx = [i for i,t in enumerate(batch["tag"]) if t in ("agreement","reflexive","npi","morphology","entity")]
-            if len(rich_idx) >= args.batch_size // 2:
-                sel = rich_idx[:args.batch_size//2] + list(range(args.batch_size//2))
-                prefixes = [batch["prefix"][i] for i in sel]
-            else:
-                prefixes = batch["prefix"]
-        else:
-            prefixes = batch["prefix"]
+        prefixes = batch  # Already a list of strings due to identity_collate_fn
 
-        # Light nudge: append a small cue token to expose the locus (helps heuristics)
-        prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
+        # # Light nudge: append a small cue token to expose the locus (helps heuristics)
+        # prefixes = [p + " is" if re.search(r"\b\w+s\b$", p) else p for p in prefixes]
 
         # Generate short student attempts
         gen_start = time.time()
-        # Adaptive decode budget (shorter contexts → fewer new tokens)
-        avg_len = sum(len(p.split()) for p in prefixes)/len(prefixes)
-        adaptive_new = 8 if avg_len < 10 else 12
-        attempts = generate(student, tok, prefixes, max_new_tokens=adaptive_new, temperature=0.9, top_p=0.9)
+        attempts = generate(student, tok, prefixes, temperature=0.9, top_p=0.9)
         # Ensure strings for downstream typing (guard lints)
         attempts = [a if isinstance(a, str) else "" for a in attempts]
         gen_time = time.time() - gen_start
@@ -269,14 +352,15 @@ def main():
                 if step % 25 == 0:
                     audit_records = []
                     for idx, o_sub in zip(idxs_to_correct, outs_subset):
+                        # lines = o_sub.corrected.split('\n')
+                        # flatten lines into single string with | separator
+                        # lines = re.split(r'[\n|]+', o_sub.corrected)
+                        # text = " | ".join([line.strip() for line in o_sub if line.strip()])
                         audit_records.append({
                             "step": int(step),
                             "prefix": str(prefixes[idx]),
                             "student": str(attempts[idx]),
-                            "caregiver_corrected": str(o_sub.corrected),
-                            "tag": str(o_sub.tag),
-                            "reason": str(o_sub.reason),
-                            "negative": (str(o_sub.negative) if o_sub.negative is not None else None),
+                            "caregiver_corrected": o_sub.corrected,
                         })
                     
                     # Append to audit file
@@ -292,15 +376,16 @@ def main():
                         outs.append(next(correct_iter))
                     else:
                         # Keep student's original output
-                        outs.append(CaregiverOutput(attempts[i], "other", None, "no_correction"))
+                        outs.append(CaregiverOutput(attempts[i]))
             except Exception as e:
                 logger.warning(f"⚠️  Caregiver batch failed: {e}")
-                outs = [CaregiverOutput(str(att or ""), "other", None, "caregiver_error") for att in attempts]
+                outs = [CaregiverOutput(str(att or "")) for att in attempts]
         else:
             # No samples need correction
-            outs = [CaregiverOutput(str(att or ""), "other", None, "no_correction") for att in attempts]
+            outs = [CaregiverOutput(str(att or "")) for att in attempts]
         
         y_star = [o.corrected for o in outs]
+        # y_star = text
         correct_time = time.time() - correct_start
         step_times["correct"] += correct_time
 
@@ -327,10 +412,10 @@ def main():
         L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
 
         # --- DPO block (optional) ---
-        if args.use_dpo:
+        if args.use_dpo and False:
             xs_dpo, yp, yn = [], [], []
             for x, o in zip(prefixes, outs):
-                if not o.negative:
+                if not o.corrected:
                     continue
                 # filter by reference preference (only strong contrastive pairs)
                 lp_pos_ref = logprob_sum(reference, tok, [x], [o.corrected])[0]
@@ -346,7 +431,7 @@ def main():
 
         # --- Combine losses (final total) ---
         dpo_weight = 1.0 if args.use_dpo else 0.0
-        loss = L_sft + 0.03 * L_kl + dpo_weight * L_dpo
+        loss = L_sft + 0 * L_kl + dpo_weight * L_dpo
         step_times["forward"] += time.time() - forward_start
 
         backward_start = time.time()
@@ -412,7 +497,7 @@ def main():
         # Evaluation and checkpointing
         if step % args.eval_every == 0:
             logger.info("🔍 Running BLiMP (real) evaluation…")
-            bl, per_cat = eval_blimp_hf(student, tok, n_per_cat=200, max_len=64, progress=False)
+            bl, per_cat = eval_blimp_hf(student, tok, n_per_cat=100, max_len=64, progress=False)
             logger.eval(step, f"BLiMP (real): {bl:.3f}")
 
             

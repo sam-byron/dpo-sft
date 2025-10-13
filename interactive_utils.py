@@ -91,9 +91,6 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
 @dataclass
 class CaregiverOutput:
     corrected: str
-    tag: str
-    negative: Optional[str]
-    reason: str
 
 
 ALLOWED_TAGS = {"agreement","reflexive","npi","entity","morphology","other"}
@@ -109,34 +106,8 @@ def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
     
     Falls back gracefully if format is malformed.
     """
-    lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
     
-    corrected = student_fallback
-    tag = "other"
-    negative = None
-    reason = "No specific correction needed"
-    
-    for line in lines:
-        if line.startswith("CORRECTED:"):
-            corrected = line[10:].strip()
-        elif line.startswith("TAG:"):
-            raw_tag = line[4:].strip().lower()
-            if raw_tag in ALLOWED_TAGS:
-                tag = raw_tag
-        elif line.startswith("NEGATIVE:"):
-            neg_text = line[9:].strip()
-            if neg_text and neg_text.upper() != "NONE":
-                negative = neg_text
-        elif line.startswith("REASON:"):
-            reason = line[7:].strip()
-    
-    # Sanity check lengths
-    if len(corrected.split()) > 30:
-        corrected = " ".join(corrected.split()[:30])
-    if negative and len(negative.split()) > 30:
-        negative = " ".join(negative.split()[:30])
-    
-    return CaregiverOutput(corrected, tag, negative, reason)
+    return CaregiverOutput(" ".join(text.split()))
 
 
 class Caregiver:
@@ -155,62 +126,63 @@ class Caregiver:
         self.model.eval()
         
         if torch.cuda.is_available():
-            self.model = self.model.to('cuda')  # type: ignore[call-arg]
+            self.model = self.model.to('cuda')  # type: ignore[call-arg]       
 
-        self.system_text = (
-            "You are a precise language teacher. "
-            "Given a student's output, provide corrections in this exact format:\n\n"
-            "CORRECTED: <corrected text>\n"
-            "TAG: <one of: agreement, reflexive, npi, entity, morphology, other>\n"
-            "NEGATIVE: <wrong alternative or NONE>\n"
-            "REASON: <brief explanation>\n\n"
-            "Keep all text concise (≤20 tokens per field)."
-        )
-        # Pre-tokenize system prompt
-        self.system_ids = self.tok(self.system_text, return_tensors="pt", add_special_tokens=False)
 
     # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
     def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
-        batch_snippets = [
-            f"Prefix: {p}\nStudent: {s}\n\n"
+        # prompt = f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected version of the second half such that the sentence requires the minimal number of edits. Provide one sentence only.\nCorrected version:"
+
+        prompts = [
+           f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected " 
+           "version of the second half such that the sentence requires the minimal number of edits. You must preserves the first half exactly. "
+           "Provide one sentence only.\nCorrected version:"
             for p, s in zip(prefixes, students)
         ]
+        self.model.eval()
+        self.tok.padding_side = "left"
+        chat_payloads = self.tok.apply_chat_template(
+            [[
+                {"role": "system", "content": "You are a teacher."},
+                {"role": "user", "content": p}
+            ] for p in prompts],
+            tokenize=False,
+            add_generation_prompt=True,
+            # padding_side="left"
+        )
         
         # Bucketed padding
-        target_len = pad_to_bucket(batch_snippets, self.tok, buckets=[64, 128, 256])
-        dyn = self.tok(batch_snippets, return_tensors="pt", padding='max_length', 
-                      max_length=target_len, truncation=True, add_special_tokens=False)
-        
-        # Concatenate system + dynamic
-        input_ids = torch.cat([
-            self.system_ids["input_ids"].expand(dyn["input_ids"].size(0), -1), 
-            dyn["input_ids"]
-        ], dim=1)
-        attn_mask = torch.cat([
-            torch.ones_like(self.system_ids["input_ids"]).expand(dyn["attention_mask"].size(0), -1), 
-            dyn["attention_mask"]
-        ], dim=1)
-        
-        device = next(self.model.parameters()).device
-        input_ids = input_ids.to(device)
-        attn_mask = attn_mask.to(device)
-
+        # target_len = pad_to_bucket(chat_payloads, self.tok, buckets=[64, 128, 256])
+        tok_chat_payload = self.tok(chat_payloads, return_tensors="pt", padding=True, truncation=True)
+        # dyn = {k: v.to('cuda') for k, v in tok_chat_payload.items()}
+        # tok_chat_payload.to('cuda')
+        # Move to device once
+        input_ids = tok_chat_payload.input_ids.to(DEVICE)
+        attention_mask = tok_chat_payload.attention_mask.to(DEVICE)
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-            gen = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attn_mask,
-                max_new_tokens=64,  # Slightly more room for text format
-                pad_token_id=self.tok.eos_token_id,
-                eos_token_id=self.tok.eos_token_id,
-                use_cache=True,
-            )
+            generated_ids = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=10,
+            eos_token_id=self.tok.eos_token_id,
+            pad_token_id=self.tok.pad_token_id,
+            do_sample=True,
+            # temperature=0.7,
+            # top_p=0.9,
+            # repetition_penalty=1.1,
+            # early_stopping=True,
+        )
+        
+        generated_ids = [
+            output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids
+        , generated_ids)
+        ]
 
-        # Decode new tokens
-        new_tokens = gen[:, input_ids.size(1):]
+        responses = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
         results = []
-        for i, (pfx, stu) in enumerate(zip(prefixes, students)):
-            txt = self.tok.decode(new_tokens[i], skip_special_tokens=True)
-            results.append(parse_caregiver_text(txt, stu.strip()))
+        # Parse each response
+        for response, student in zip(responses, students):
+            results.append(parse_caregiver_text(response, student.strip()))
         
         return results
 
@@ -255,99 +227,6 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-class BNCPrefixStream(Dataset):
-    """
-    Map-style dataset of short prefixes (8–20 tokens) from BNC-like text.
-    If bnc_name is provided, loads HF dataset (non-streaming) and materializes items;
-    otherwise reads *.txt files under bnc_dir. Each item is a dict {"prefix", "tag"}.
-    """
-    def __init__(
-        self,
-        tokenizer,
-        bnc_name: Optional[str],
-        bnc_dir: Optional[str],
-        max_len_tokens: int = 20,
-        limit: Optional[int] = None,
-        seed: int = 0,
-    ) -> None:
-        self.tok = tokenizer
-        self.bnc_name = bnc_name
-        self.bnc_dir = bnc_dir
-        self.max_len = max_len_tokens
-        self.limit = limit
-        self.rng = random.Random(seed)
-        self.items: List[Dict[str, str]] = []
-
-        if self.bnc_name:
-            self._collect_hf()
-        elif self.bnc_dir:
-            self._collect_dir()
-        else:
-            self.items = []
-
-    def _maybe_add_sentence(self, sent: str):
-        sent = clean_text(sent)
-        if not sent:
-            return
-        toks = self.tok.tokenize(sent)
-        if not (4 <= len(toks) <= 48):
-            return
-        words = sent.split()
-        if len(words) < 4:
-            return
-        min_len = 4
-        max_len = min(self.max_len, len(words))
-        if max_len < min_len:
-            return
-        # Prefer longer prefixes when possible
-        if max_len >= 8:
-            L = self.rng.randint(8, max_len)
-        else:
-            L = self.rng.randint(min_len, max_len)
-        prefix = " ".join(words[:L])
-        tag = "other"
-        for k, rgx in PHENOMENON_PATTERNS.items():
-            if rgx.match(prefix):
-                tag = k
-                break
-        self.items.append({"prefix": prefix, "tag": tag})
-
-    def _collect_hf(self):
-        # self.bnc_name is guaranteed non-None when this is called
-        name = cast(str, self.bnc_name)
-        ds = load_dataset(name, split="train")  # materialized dataset
-        for ex in ds:
-            text = (ex.get("text") if isinstance(ex, dict) else None) or (
-                ex.get("content") if isinstance(ex, dict) else None
-            ) or ""
-            if not text:
-                continue
-            for sent in re.split(r"(?<=[.!?])\s+", text):
-                self._maybe_add_sentence(sent)
-                if self.limit is not None and len(self.items) >= self.limit:
-                    return
-
-    def _collect_dir(self):
-        # self.bnc_dir is guaranteed non-None when this is called
-        dir_path = cast(str, self.bnc_dir)
-        for root, _, files in os.walk(dir_path):
-            for f in files:
-                if not f.lower().endswith(".txt"):
-                    continue
-                with open(os.path.join(root, f), "r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        for sent in re.split(r"(?<=[.!?])\s+", clean_text(line)):
-                            self._maybe_add_sentence(sent)
-                            if self.limit is not None and len(self.items) >= self.limit:
-                                return
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __getitem__(self, idx: int) -> Dict[str, str]:
-        return self.items[idx]
-
-
 def batchify(items, bs):
     it = iter(items)
     while True:
@@ -356,8 +235,11 @@ def batchify(items, bs):
         yield b
 
 @torch.no_grad()
-def generate(model, tok, prefixes, max_new_tokens=12, temperature:Optional[float]=None, top_p:Optional[float]=None):
+def generate(model, tok, prefixes, max_new_tokens=120, temperature:Optional[float]=None, top_p:Optional[float]=None):
     model.eval()
+    # Set left padding for generation
+    orig_padding_side = tok.padding_side
+    tok.padding_side = 'left'
     # Sort by length to reduce padding (then unsort)
     lengths = [len(p.split()) for p in prefixes]
     order = sorted(range(len(prefixes)), key=lambda i: lengths[i])
@@ -368,8 +250,9 @@ def generate(model, tok, prefixes, max_new_tokens=12, temperature:Optional[float
 
     # Use bucketed padding for stable shapes
     target_len = pad_to_bucket(ordered, tok)
+    tok.padding_side = 'left'
     enc = tok(ordered, return_tensors="pt", padding='max_length', 
-              max_length=target_len, truncation=True).to(DEVICE)
+              max_length=max_new_tokens, truncation=False).to(DEVICE)
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         
