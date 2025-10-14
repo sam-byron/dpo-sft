@@ -531,7 +531,7 @@ def main():
         return
     
     prepare_data(
-        config, tokenizer=AutoTokenizer.from_pretrained(config["tokenizer_path"])
+        config, tokenizer=AutoTokenizer.from_pretrained(config["tokenizer_path"], prefixes=False)
     )
 
 if __name__ == "__main__":
