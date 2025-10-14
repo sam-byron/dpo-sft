@@ -25,7 +25,7 @@ from blimp import run_subset, ensure_subsets_list, pick_split
 
 from interactive_utils import Caregiver, CaregiverOutput, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
 
-from prepare_data import prepare_data, load_or_prepare_dataset
+from prepare_data import load_or_prepare_dataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(7)
@@ -65,9 +65,11 @@ logger = get_logger("BabyLM-Interactive")
 
 from datasets import load_dataset, get_dataset_config_names
 
-def build_model(model_name="gpt2"):
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_config(config)
+def build_model(checkpoint_path):
+
+    config_path = os.path.join(checkpoint_path, "config.json")
+    model_config = AutoConfig.from_pretrained(config_path)
+    model = AutoModelForCausalLM.from_config(model_config)
 
     return model
 
@@ -91,7 +93,10 @@ def main():
 
     with open(args.config_path, "r") as config_file:
         config = json.load(config_file)
-
+    checkpoint_path = os.path.join(config["cache_path"], "checkpoint")
+    model_config_path = os.path.join(checkpoint_path, "config.json")
+    with open(model_config_path, "r") as f:
+        model_config = json.load(f)
     # Defaults for initial eval placeholders to satisfy static analyzers
     bl0 = 0.0
     mo0 = 0.0
@@ -109,12 +114,12 @@ def main():
     logger.info(f"🚀 Performance optimizations: batch generation, parallel data loading, profiling enabled")
 
     # Model/tokenizer loading
-    checkpoint_path = os.path.join(config["cache_path"], "checkpoint")
+    
     if args.model_path:
         logger.info(f"Loading base + LoRA (adapters trainable only) from: {Fore.CYAN}{args.model_path}{Style.RESET_ALL}")
         # Discover base model from adapter config, else fall back to --model_name
         try:
-            student = build_model()
+            student = build_model(checkpoint_path)
             weights_path = os.path.join(args.model_path, "pytorch_model.bin")
             if os.path.isfile(weights_path):
                 state_dict = torch.load(weights_path, map_location="cpu")
@@ -127,41 +132,28 @@ def main():
             logger.error(f"Model-only weight restore failed: {ee}")
 
         # Tokenizer
-        # Enforce tokenizer model_max_length from config (fallback to max_position_embeddings, then 512)
-        tkn_max_len = int(config.get("model_max_length", config.get("max_position_embeddings", 512)))
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.get("tokenizer_path", "./model_babylm_gpt2_16k"),
-            model_max_length=tkn_max_len,
-        )
-        # Explicitly set (some fast tokenizers ignore constructor kwarg)
-        try:
-            tokenizer.model_max_length = tkn_max_len
-        except Exception:
-            pass
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        tokenizer.model_max_length = model_config.get("n_ctx")
         print(f"Tokenizer model_max_length set to {getattr(tokenizer, 'model_max_length', 'N/A')}")
+        
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # Decoder models need left padding
         tokenizer.padding_side = 'left'
-
-        # Freeze base weights; train only LoRA adapter params
-        for n, p in student.named_parameters():
-            if "lora" in n.lower():
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
         student.train()
-        logger.info("Loaded base + LoRA; adapters set trainable, base frozen")
+        student.to(DEVICE)
+        logger.info("Loaded student model")
     else:
         logger.info("Loading tokenizer...")
         # Use fast tokenizer explicitly for better performance
-        tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
         # Fix padding side for decoder-only models (critical for generation quality)
-        tok.padding_side = 'left'  # This should be the ONLY place we set padding_side
+        tokenizer.padding_side = 'left'  # This should be the ONLY place we set padding_side
         logger.info(f"Set tokenizer padding_side to: {Fore.GREEN}left{Style.RESET_ALL} (required for decoder-only models)")
-        logger.info(f"Using fast tokenizer: {Fore.GREEN}{tok.is_fast}{Style.RESET_ALL}")
+        logger.info(f"Using fast tokenizer: {Fore.GREEN}{tokenizer.is_fast}{Style.RESET_ALL}")
         logger.info(f"Suppressed tokenizer parallelism warnings via environment variable")
 
         # Student + LoRA (fresh init)
@@ -258,12 +250,12 @@ def main():
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, betas=(0.9,0.95), weight_decay=0.01)
     sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=500, num_training_steps=args.steps)
 
-    budget = WordBudget(100_000_000)
+    budget = WordBudget(20_000_000)
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
 
     logger.info("Running initial evaluation on REAL BLiMP…")
-    # bl0, per_cat0 = eval_blimp_hf(student, tok, n_per_cat=100, max_len=64, progress=True)
-    # # mo0 = mini_morph(student, tok)
+    # bl0, per_cat0 = eval_blimp_hf(student, tokenizer, n_per_cat=100, max_len=64, progress=True)
+    # # mo0 = mini_morph(student, tokenizer)
     # logger.eval(0, f"Initial BLiMP (real): {bl0:.3f}")
 
     
@@ -290,7 +282,7 @@ def main():
 
         # Generate short student attempts
         gen_start = time.time()
-        attempts = generate(student, tok, prefixes, temperature=0.9, top_p=0.9)
+        attempts = generate(student, tokenizer, prefixes, temperature=0.9, top_p=0.9)
         # Ensure strings for downstream typing (guard lints)
         # attempts = [a if isinstance(a, str) else "" for a in attempts]
         gen_time = time.time() - gen_start
@@ -298,7 +290,7 @@ def main():
         
         # NEW: Calculate uncertainty and select samples for correction
         correct_start = time.time()
-        uncertainties = get_uncertainty(student, tok, prefixes, attempts)
+        uncertainties = get_uncertainty(student, tokenizer, prefixes, attempts)
 
         # Correct top 20% most uncertain samples
         threshold = sorted(uncertainties, reverse=True)[int(0.2 * len(uncertainties))]
@@ -375,19 +367,19 @@ def main():
 
         # --- Compute core losses first ---
         forward_start = time.time()
-        L_sft = ce_targets(student, tok, prefixes, y_star)
-        L_kl  = kl_to_ref(student, reference, tok, prefixes, attempts)  # ✅ Use attempts, not y_star
+        L_sft = ce_targets(student, tokenizer, prefixes, y_star)
+        L_kl  = kl_to_ref(student, reference, tokenizer, prefixes, attempts)  # ✅ Use attempts, not y_star
         L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
 
         # --- DPO block (optional) ---
-        if args.use_dpo and False:
+        if args.use_dpo and False:  # Temporarily disabled until we have real pairs
             xs_dpo, yp, yn = [], [], []
             for x, o in zip(prefixes, outs):
                 if not o.corrected:
                     continue
                 # filter by reference preference (only strong contrastive pairs)
-                lp_pos_ref = logprob_sum(reference, tok, [x], [o.corrected])[0]
-                lp_neg_ref = logprob_sum(reference, tok, [x], [o.negative])[0]
+                lp_pos_ref = logprob_sum(reference, tokenizer, [x], [o.corrected])[0]
+                lp_neg_ref = logprob_sum(reference, tokenizer, [x], [o.negative])[0]
                 if (lp_pos_ref - lp_neg_ref).item() < 0.1:
                     continue
                 xs_dpo.append(x)
@@ -395,11 +387,11 @@ def main():
                 yn.append(o.negative)
 
             if xs_dpo:
-                L_dpo = dpo_loss(student, reference, tok, xs_dpo, yp, yn, beta=2.0)
+                L_dpo = dpo_loss(student, reference, tokenizer, xs_dpo, yp, yn, beta=2.0)
 
         # --- Combine losses (final total) ---
         dpo_weight = 1.0 if args.use_dpo else 0.0
-        loss = L_sft + 0 * L_kl + dpo_weight * L_dpo
+        loss = L_sft + 0.25 * L_kl + dpo_weight * L_dpo
         step_times["forward"] += time.time() - forward_start
 
         backward_start = time.time()
@@ -465,7 +457,7 @@ def main():
         # Evaluation and checkpointing
         if step % args.eval_every == 0:
             logger.info("🔍 Running BLiMP (real) evaluation…")
-            bl, per_cat = eval_blimp_hf(student, tok, n_per_cat=100, max_len=64, progress=False)
+            bl, per_cat = eval_blimp_hf(student, tokenizer, n_per_cat=100, max_len=64, progress=True)
             logger.eval(step, f"BLiMP (real): {bl:.3f}")
 
             
@@ -502,7 +494,7 @@ def main():
     # Final evaluation and summary
     logger.info("🏁 Running final evaluation...")
     final_bl = 0.0
-    final_mo = mini_morph(student, tok)
+    final_mo = mini_morph(student, tokenizer)
     
     # Calculate improvements (with fallback if initial eval was skipped)
     bl_improvement = final_bl - bl0 if 'bl0' in locals() else 0.0
@@ -535,4 +527,7 @@ if __name__ == "__main__":
     #     logger.info("Enabled torch.compile for student & reference.")
     # except Exception as e:
     #     logger.warning(f"torch.compile skipped: {e}")
+
+
+
 

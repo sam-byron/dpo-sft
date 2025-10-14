@@ -1,6 +1,12 @@
-import os, re, math, random, json, argparse, itertools, time
+import os
+import re
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, cast
+import itertools
+
+import torch
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 # Suppress tokenizer parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -112,7 +118,6 @@ def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
 
 
 class Caregiver:
-    """Caregiver model that provides text-based corrections without JSON."""
     def __init__(self, model_name: str = 'Qwen/Qwen2.5-1.5B-Instruct', rng_seed: int = 0):
         self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tok.pad_token is None:
@@ -129,63 +134,115 @@ class Caregiver:
         if torch.cuda.is_available():
             self.model = self.model.to('cuda')  # type: ignore[call-arg]       
 
+        # Stronger system prompt with constraints + inline few-shots
+        self.system_prompt = (
+            "You are a precise suffix corrector. You receive a sentence in two parts: Prefix and Suffix. "
+            "Correct ONLY the Suffix so that 'Prefix + Suffix' is grammatical, coherent, and faithful in meaning. "
+            "Make the minimum necessary edits (grammar, agreement, semantics, punctuation). Do not change the Prefix. "
+            "If the Suffix is already acceptable, return it unchanged. If Suffix is empty, return the shortest natural continuation. "
+            "Output ONLY the corrected Suffix. No quotes, no labels, no explanations. Keep it concise (<= 15 tokens). "
+            "Do not repeat the Prefix.\n\n"
+            "Examples:\n"
+            "Prefix: The cat sat\nSuffix: in the sun.\nAnswer: in the sun.\n"
+            "Prefix: She\nSuffix: see themselves.\nAnswer: saw herself.\n"
+            "Prefix: They\nSuffix: is happy.\nAnswer: are happy.\n"
+            "Prefix: Judge Stanley Spence told Creagh: 'You were a\nSuffix:\nAnswer: good man.'\n"
+            "Prefix: In a business any operating loss\nSuffix: has been carried down\nAnswer: has been carried forward\n"
+            "Prefix: He pointed ahead through\nSuffix: the room to be taken on\nAnswer: the door\n"
+        )
 
-    # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
-    def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
-        # prompt = f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected version of the second half such that the sentence requires the minimal number of edits. Provide one sentence only.\nCorrected version:"
-
-        prompts = [
-           f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected " 
-           "version of the second half such that the sentence requires the minimal number of edits. You must preserves the first half exactly. "
-           "Provide one sentence only.\nCorrected version:"
-            for p, s in zip(prefixes, students)
+        # Few-shot pairs used as chat turns (helps small models)
+        self._few_shots = [
+            ("The cat sat", "in the sun.", "in the sun."),
+            ("She", "see themselves.", "saw herself."),
+            ("They", "is happy.", "are happy."),
+            ("Judge Stanley Spence told Creagh: 'You were a", "", "good man.'"),
+            ("In a business any operating loss", "has been carried down", "has been carried forward"),
+            ("He pointed ahead through", "the room to be taken on", "the door"),
         ]
+
+    # --- helpers ---
+    def _build_messages(self, prefix: str, suffix: str):
+        msgs = [{"role": "system", "content": self.system_prompt}]
+        for p, s, a in self._few_shots:
+            msgs.append({"role": "user", "content": f"Prefix: {p}\nSuffix: {s}\nReturn only the corrected Suffix."})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": f"Prefix: {prefix}\nSuffix: {suffix}\nReturn only the corrected Suffix."})
+        return msgs
+
+    def _clean_suffix(self, text: str, forbid_prefixes: List[str]) -> str:
+        t = text.strip()
+        # Cut at first newline or chat marker
+        cut_markers = ["\nPrefix:", "\nSuffix:", "\nSystem:", "\nUser:", "\nAssistant:"]
+        for m in cut_markers:
+            idx = t.find(m)
+            if idx != -1:
+                t = t[:idx]
+        # Strip wrapping quotes
+        if len(t) >= 2 and ((t[0], t[-1]) in {('"', '"'), ("'", "'")}):
+            t = t[1:-1].strip()
+        # Remove any leaked labels
+        t = re.sub(r'^\s*(Prefix:|Suffix:|Answer:)\s*', '', t, flags=re.I)
+        # If model echoed any forbidden label, drop everything before last colon
+        for fp in forbid_prefixes:
+            pos = t.find(fp)
+            if pos != -1:
+                t = t[:pos]
+        # Collapse spaces
+        t = " ".join(t.split())
+        # Cap to 15 tokens
+        toks = t.split()
+        if len(toks) > 15:
+            t = " ".join(toks[:15])
+        return t
+
+    def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
+        prompts = [self._build_messages(p, s) for p, s in zip(prefixes, students)]
+
+        # Build chat inputs per sample (with few-shots included)
         self.model.eval()
         self.tok.padding_side = "left"
+
         chat_payloads = self.tok.apply_chat_template(
-            [[
-                {"role": "system", "content": "You are a teacher."},
-                {"role": "user", "content": p}
-            ] for p in prompts],
+            prompts,
             tokenize=False,
             add_generation_prompt=True,
-            # padding_side="left"
         )
-        
-        # Bucketed padding
-        # target_len = pad_to_bucket(chat_payloads, self.tok, buckets=[64, 128, 256])
-        tok_chat_payload = self.tok(chat_payloads, return_tensors="pt", padding=True, truncation=True)
-        # dyn = {k: v.to('cuda') for k, v in tok_chat_payload.items()}
-        # tok_chat_payload.to('cuda')
-        # Move to device once
-        input_ids = tok_chat_payload.input_ids.to(DEVICE)
-        attention_mask = tok_chat_payload.attention_mask.to(DEVICE)
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-            generated_ids = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=20,
-            eos_token_id=self.tok.eos_token_id,
-            pad_token_id=self.tok.pad_token_id,
-            do_sample=True,
-            # temperature=0.7,
-            # top_p=0.9,
-            # repetition_penalty=1.1,
-            # early_stopping=True,
-        )
-        
-        generated_ids = [
-            output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids
-        , generated_ids)
-        ]
 
-        responses = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
-        results = []
-        # Parse each response
-        for response, student in zip(responses, students):
-            results.append(parse_caregiver_text(response, student.strip()))
-        
-        return results
+        enc = self.tok(
+            chat_payloads,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
+        ).to(DEVICE)
+
+        # Disallow label words to reduce leakage
+        bad_words = ["Prefix:", "Suffix:", "System:", "User:", "Assistant:", "Answer:"]
+        bad_words_ids = [self.tok.encode(w, add_special_tokens=False) for w in bad_words if w]
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+            out_ids = self.model.generate(
+                input_ids=enc.input_ids,
+                attention_mask=enc.attention_mask,
+                max_new_tokens=20,
+                do_sample=False,              # greedy for stability on 1.5B
+                temperature=1.0,
+                top_p=1.0,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
+                bad_words_ids=bad_words_ids if bad_words_ids else None,
+                eos_token_id=self.tok.eos_token_id,
+                pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id,
+                use_cache=True,
+            )
+
+        # Keep only generated tail
+        gen_only = [o[len(i):] for i, o in zip(enc.input_ids, out_ids)]
+        texts = self.tok.batch_decode(gen_only, skip_special_tokens=True)
+
+        cleaned = [self._clean_suffix(t, forbid_prefixes=["\nPrefix:", "\nSuffix:", "Answer:"]) for t in texts]
+        return [CaregiverOutput(c) for c in cleaned]
 
     def correct(self, prefix: str, student: str) -> CaregiverOutput:
         """Single correction."""
@@ -236,36 +293,58 @@ def batchify(items, bs):
         yield b
 
 @torch.no_grad()
-def generate(model, tok, prefixes, max_new_tokens=120, temperature: Optional[float]=None, top_p: Optional[float]=None):
+def generate(model, tok, prefixes, max_new_tokens=12, temperature=1.0, top_p=0.9):
     model.eval()
-    orig_padding_side = tok.padding_side
-    tok.padding_side = 'left'
-    try:
-        target_len = pad_to_bucket(prefixes, tok)
-        enc = tok(prefixes, return_tensors="pt", padding='max_length',
-                  max_length=target_len, truncation=False).to(DEVICE)
-        gen_kwargs = dict(max_new_tokens=max_new_tokens,
-                          pad_token_id=tok.eos_token_id,
-                          eos_token_id=tok.eos_token_id,
-                          use_cache=True)
-        if temperature is not None or top_p is not None:
-            gen_kwargs.update(do_sample=True,
-                              temperature=temperature if temperature is not None else 1.0,
-                              top_p=top_p if top_p is not None else 1.0)
-        out = model.generate(**enc, **gen_kwargs)
+    # lengths = [len(p.split()) for p in prefixes]
+    # order = sorted(range(len(prefixes)), key=lambda i: lengths[i])
+    # rev = [0]*len(order)
+    # for i, oi in enumerate(order): rev[oi] = i
+    # ordered = [prefixes[i] for i in order]
+    target_len = pad_to_bucket(prefixes, tok)
+    enc = tok(prefixes, return_tensors="pt", padding="max_length",
+              max_length=target_len, truncation=True).to(DEVICE)
+    
+    # CRITICAL FIX: Ensure attention_mask is set correctly for left-padded sequences
+    # Left padding means pad tokens are at the START, so we need to shift the mask
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    
+    # Debugging: check if left padding is causing issues
+    # Print first example to verify padding
+    if torch.rand(1).item() < 0.01:  # 1% of batches
+        print(f"[DEBUG] First input_ids: {input_ids[0][:20].tolist()}")
+        print(f"[DEBUG] First attn_mask: {attention_mask[0][:20].tolist()}")
+        print(f"[DEBUG] Decoded prefix: {tok.decode(input_ids[0][attention_mask[0].bool()], skip_special_tokens=False)}")
+    
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        out = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.2,  # Penalize repeating tokens
+            no_repeat_ngram_size=3,  # Prevent exact 3-gram repeats
+            pad_token_id=tok.eos_token_id,
+            eos_token_id=tok.eos_token_id,
+            use_cache=True,
+        )
 
-        # continuation via attention_mask length (works with left padding)
-        input_lens = enc["attention_mask"].sum(dim=1).tolist()
-        continuations = []
-        for i, seq in enumerate(out):
-            cont_ids = seq[input_lens[i]:]
-            continuations.append(tok.decode(cont_ids, skip_special_tokens=True))
-
-        # return concatenated attempts
-        attempts = [p + c for p, c in zip(prefixes, continuations)]
-        return attempts
-    finally:
-        tok.padding_side = orig_padding_side
+    out = [
+        output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids, out)
+    ]
+    return [tok.decode(g, skip_special_tokens=True).strip() for g in out]
+    # Calculate actual input lengths (non-padding tokens)
+    # input_lens = attention_mask.sum(dim=1).tolist()
+    # gens = []
+    # for i, seq in enumerate(out):
+    #     gen_part = seq[input_lens[i]:]
+    #     gens.append(tok.decode(gen_part, skip_special_tokens=True).strip())
+    # restored = [None]*len(gens)
+    # for i, gi in enumerate(gens):
+    #     restored[order[i]] = gi
+    # return restored
 
 def ce_targets(student, tok, x_list, y_list):
     student.train()
@@ -480,3 +559,78 @@ def combined_loss(student, reference, tok, prefixes, y_star, kl_weight=0.03):
     kl_approx = F.mse_loss(st_logits[mask_y], ref_logits[mask_y].detach())
     
     return L_sft + kl_weight * kl_approx, L_sft, kl_approx
+
+import difflib
+import math
+from typing import List, Tuple
+
+def _norm_logprob_per_tok(model, tok, x: str, y: str) -> float:
+    lp = logprob_sum(model, tok, [x], [y])[0].item()
+    ntoks = len(tok(y, add_special_tokens=False).input_ids)
+    return lp / max(ntoks, 1)
+
+def _rep_frac(text: str, n: int = 3) -> float:
+    toks = text.split()
+    if len(toks) < n+1: return 0.0
+    seen, reps = set(), 0
+    for i in range(len(toks)-n+1):
+        ng = tuple(toks[i:i+n])
+        reps += (ng in seen)
+        seen.add(ng)
+    return reps / max(len(toks)-n+1, 1)
+
+def _prefix_leak(prefix: str, cand: str) -> float:
+    # penalize if cand starts with last 3–6 words of prefix
+    pw = prefix.split()[-6:]
+    cw = cand.split()[:6]
+    m = 0
+    for k in range(6, 2, -1):
+        if pw[-k:] == cw[:k]:
+            m = k; break
+    return float(m > 0)
+
+def _jaccard(a: str, b: str) -> float:
+    sa, sb = set(a.split()), set(b.split())
+    if not sa and not sb: return 1.0
+    return len(sa & sb) / max(len(sa | sb), 1)
+
+def build_contrastive_pairs(
+    student, reference, tok, prefixes: List[str], attempts: List[str],
+    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 15
+) -> Tuple[List[str], List[str], List[str]]:
+    xs, chosen, rejected = [], [], []
+    for x, a0 in zip(prefixes, attempts):
+        # pool candidates
+        pool = set()
+        pool.add(a0.strip())
+        gens = []
+        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.0, top_p=1.0)  # greedy
+        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.7, top_p=0.9)
+        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.9, top_p=0.95)
+        for g in gens:
+            pool.add((g or "").strip())
+            if len(pool) >= k_per_prefix+2: break
+        cand_list = [c for c in pool if c]
+
+        # score
+        scored = []
+        for y in cand_list:
+            s = _norm_logprob_per_tok(reference, tok, x, y)
+            s -= 0.8 * _rep_frac(y, n=3)
+            s -= 0.8 * _prefix_leak(x, y)
+            if len(y.split()) > max_len: s -= 0.5
+            if not y: s -= 1.0
+            scored.append((s, y))
+
+        if not scored: continue
+        scored.sort(key=lambda t: t[0])
+        s_lo, y_lo = scored[0]
+        s_hi, y_hi = scored[-1]
+
+        # filter weak/near-duplicate pairs
+        if (s_hi - s_lo) < margin: continue
+        if _jaccard(y_hi, y_lo) > 0.7: continue
+        if y_hi == y_lo: continue
+
+        xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
+    return xs, chosen, rejected
