@@ -13,6 +13,7 @@ import random
 from functools import partial
 # Legacy concatenation path retained for reference, but we now implement direct block writer
 from multiprocessing import Pool
+from sympy import prefixes
 import torch
 import multiprocessing as mp
 from itertools import islice
@@ -62,8 +63,8 @@ def chunked(iterable, size):
             break
 
 class GPTDataset(Dataset):
-    def __init__(self, data_dir, prepacked_segments=None):
-
+    def __init__(self, data_dir, prepacked_segments=None, prefixes=False):
+        self.prefixes = prefixes
         """Load all .md files as complete file contents, not line by line"""
         if prepacked_segments is not None:
             self.segments = prepacked_segments
@@ -100,34 +101,38 @@ class GPTDataset(Dataset):
             return self._get_single_item(index)
     
     def _get_single_item(self, index):
+         
         """Get a single item by index, split into sentences"""
         segment = self.segments[index]
-        
-        # Split on sentence boundaries and <|endoftext|>
-        import re
-        
-        # First split on <|endoftext|> to handle document boundaries
-        parts = segment.split('<|endoftext|>')
-        
-        sentences = []
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-                
-            # Split on sentence-ending punctuation followed by whitespace or end of string
-            # This regex looks for . ! ? followed by whitespace or end of string
-            sent_pattern = r'(?<=[.!?])\s+|(?<=[.!?])$'
-            sent_parts = re.split(sent_pattern, part)
+    
+        if self.prefixes == False:
+            return {"text": segment}
+        else:  
+            # Split on sentence boundaries and <|endoftext|>
+            import re
             
-            for sent in sent_parts:
-                sent = sent.strip()
-                word_count = len(sent.split())
-                if word_count >= 10:  # Only add non-empty sentences
-                    take = min(word_count//3, 10)
-                    sentences.append(' '.join(sent.split()[:take]))
+            # First split on <|endoftext|> to handle document boundaries
+            parts = segment.split('<|endoftext|>')
+            
+            sentences = []
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                    
+                # Split on sentence-ending punctuation followed by whitespace or end of string
+                # This regex looks for . ! ? followed by whitespace or end of string
+                sent_pattern = r'(?<=[.!?])\s+|(?<=[.!?])$'
+                sent_parts = re.split(sent_pattern, part)
+                
+                for sent in sent_parts:
+                    sent = sent.strip()
+                    word_count = len(sent.split())
+                    if word_count >= 10:  # Only add non-empty sentences
+                        take = min(word_count//3, 10)
+                        sentences.append(' '.join(sent.split()[:take]))
 
-        return sentences
+                return sentences
     
 def load_md_files_to_dataset(data_dir):
     """Load all .md files as complete file contents, not line by line"""
@@ -160,7 +165,14 @@ def iter_raw_lines(data_dir):
         except Exception as e:
             print(f"Warning: Could not read {file_path}: {e}")
 
-def prepare_data(config):
+def prepare_data(config, tokenizer, prefixes=False):
+
+    cache_path = config["cache_path"]
+
+    # Ensure the cache folder exists
+    if not os.path.exists(cache_path):
+        os.makedirs(cache_path)
+        print(f"Created cache folder: {cache_path}")
 
     # Check if chunk files exist
     # chunk_paths = sorted(glob.glob(os.path.join(cache_path, "chunk*.pt")))
@@ -254,7 +266,179 @@ def prepare_data(config):
         print(f"  - dangling_carried_rate: {dangling_rate:.4f}")
         print(f"  - short_trailing_dropped_rate: {short_drop_rate:.4f}")
     # Instead of batching string segments then concatenating, directly tokenize and stream out fixed-size blocks
-    ds = GPTDataset(data_dir, prepacked_segments=packed_segments)
+    ds = GPTDataset(data_dir, prepacked_segments=packed_segments, prefixes=prefixes)
+
+    # Shuffling strategy: default = document-level (preserve intra-doc order)
+    shuffle_level = config.get("shuffle_level", "document")  # document|segment|none
+    print(f"[Shuffle] Strategy: {shuffle_level}")
+    if shuffle_level == "segment":
+        ds.shuffle()
+    elif shuffle_level == "document":
+        # Group consecutive segments between [DOC] and [EOD]
+        grouped = []
+        current = []
+        for seg in ds.segments:
+            txt = seg
+            # detect DOC start
+            if txt.startswith('[DOC]') and current:
+                # edge case: stray new doc start without prior EOD
+                grouped.append(current)
+                current = []
+            current.append(seg)
+            if txt.rstrip().endswith('[EOD]'):
+                grouped.append(current)
+                current = []
+        if current:
+            grouped.append(current)
+        random.shuffle(grouped)
+        # flatten preserving internal order
+        ds.segments = [s for g in grouped for s in g]
+        print(f"[Shuffle] Documents grouped: {len(grouped)}")
+    else:
+        print("[Shuffle] No shuffling applied")
+
+    print("First 5 samples:")
+    for i in range(min(5, len(ds))):
+        sample = ds[i]
+        # print(f"Sample {i}: {sample['text']}...")
+        print(f"Sample {i}: {sample}")
+    # Print number of samples in the dataset
+    print(f"Number of samples in dataset: {len(ds)}")
+
+    # Print number of words in the dataset
+    if prefixes == False:
+        total_words = sum(len(ds[i]["text"].split()) for i in range(len(ds)))
+    else:
+        total_words = sum(len(ds[i]) for i in range(len(ds)))
+    # total_words = sum(len(ds[i].split()) for i in range(len(ds)))
+    print(f"Total words in dataset: {total_words}")
+    # return
+
+    # wrap the HuggingFace streaming IterableDataset in a PyTorch DataLoader
+    # to parallelize I/O with num_workers > 1
+    from torch.utils.data import DataLoader
+    # ================= Boundary-aware block emission (Option 1: min_fill_ratio=0.70 with carry-forward) =================
+    print(f"[BlockWriter] Buffered emission (block_size={block_size}, packing_max_len={packing_max_len})")
+    # Get pad_id using HuggingFace tokenizer API
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = 0
+        print(f"[BlockWriter][Warning] No pad_token_id or eos_token_id found, using 0 as pad_id")
+
+    # Buffer configuration
+    blocks_per_file = config.get("blocks_per_file", 1000)  # each output .pt will contain this many blocks (except final tail)
+    # Stats
+    total_blocks = 0
+    padded_blocks = 0
+    total_tokens_before_padding = 0
+    oversize_segments = 0  # should usually be 0 now that packing_max_len==block_size
+    oversize_truncated_segments = 0
+    oversize_split_segments = 0
+
+    # In-memory buffers
+    buffer_blocks: list[list[int]] = []
+    buffer_block_metas: list[dict] = []
+    file_index = 0
+
+    def flush_file(final=False):
+        nonlocal buffer_blocks, buffer_block_metas, file_index
+        if not buffer_blocks:
+            return
+        tensor = torch.tensor(buffer_blocks, dtype=torch.long)
+        out_path = os.path.join(cache_path, f"chunk{file_index}.pt")
+        torch.save(tensor, out_path)
+        meta = {
+            "file_index": file_index,
+            "num_blocks": len(buffer_blocks),
+            "block_size": block_size,
+            "blocks": buffer_block_metas,
+            "final_file": final,
+        }
+        meta_path = os.path.join(cache_path, f"chunk{file_index}.meta.json")
+        try:
+            with open(meta_path, 'w', encoding='utf-8') as mf:
+                json.dump(meta, mf)
+        except Exception as e:
+            print(f"[BlockWriter][Warn] Could not write meta for file {file_index}: {e}")
+        if file_index % 50 == 0:
+            avg_fill = total_tokens_before_padding / (total_blocks * block_size) if total_blocks else 0.0
+            print(f"[BlockWriter] Saved file {file_index} containing {len(buffer_blocks)} blocks | cumulative blocks={total_blocks} avg_fill={avg_fill:.3f}")
+        file_index += 1
+        buffer_blocks = []
+        buffer_block_metas = []
+
+    # Main pass: each packed segment should already be <= block_size.
+    for seg_idx, seg_text in enumerate(ds.segments):
+        enc = tokenizer.encode(seg_text)
+        ids = enc.ids if hasattr(enc, 'ids') else enc
+        seg_len = len(ids)
+        if seg_len > block_size:
+            # Fallback oversize handling (should be rare if packing_max_len==block_size)
+            policy = config.get("oversize_policy", "split")
+            if policy == "truncate":
+                ids = ids[:block_size]
+                seg_len = len(ids)
+                oversize_truncated_segments += 1
+            elif policy == "skip":
+                oversize_segments += 1
+                continue
+            elif policy == "split":  # split into multiple full blocks
+                start = 0
+                while start < len(ids):
+                    piece = ids[start:start+block_size]
+                    piece_len = len(piece)
+                    if piece_len < block_size:  # pad tail piece
+                        piece = piece + [pad_id] * (block_size - piece_len)
+                        padded_blocks += 1
+                    total_tokens_before_padding += piece_len
+                    buffer_blocks.append(piece)
+                    buffer_block_metas.append({
+                        "seg_idx": seg_idx,
+                        "original_seg_len": len(ids),
+                        "piece_len": piece_len,
+                        "padded": piece_len < block_size,
+                        "split_piece": True
+                    })
+                    total_blocks += 1
+                    oversize_split_segments += 1
+                    if len(buffer_blocks) >= blocks_per_file:
+                        flush_file()
+                    start += block_size
+                continue
+            else:  # raise
+                raise ValueError(f"Oversize segment encountered seg_idx={seg_idx} len={seg_len} > block_size={block_size}")
+
+        # Normal case: seg_len <= block_size
+        block_tokens = ids.copy()
+        if seg_len < block_size:
+            block_tokens.extend([pad_id] * (block_size - seg_len))
+            padded_blocks += 1
+        total_tokens_before_padding += seg_len
+        buffer_blocks.append(block_tokens)
+        buffer_block_metas.append({
+            "seg_idx": seg_idx,
+            "seg_len": seg_len,
+            "padded": seg_len < block_size,
+            "split_piece": False
+        })
+        total_blocks += 1
+        if len(buffer_blocks) >= blocks_per_file:
+            flush_file()
+
+    # Final flush
+    flush_file(final=True)
+
+    avg_fill = total_tokens_before_padding / (total_blocks * block_size) if total_blocks else 0.0
+    print("[BlockWriter][Summary]")
+    print(f"  Blocks emitted: {total_blocks}")
+    print(f"  Avg fill ratio (pre-pad): {avg_fill:.4f}")
+    print(f"  Padded blocks: {padded_blocks}")
+    print(f"  Oversize segments (skipped): {oversize_segments}")
+    print(f"  Oversize split pieces emitted: {oversize_split_segments}")
+    print(f"  Oversize truncated segments: {oversize_truncated_segments}")
+    print(f"  Files written: {file_index}")
+    return total_blocks
+
 
     return ds
 
@@ -339,12 +523,6 @@ def main():
     with open(args.config_path, "r") as config_file:
         config = json.load(config_file)
 
-    
-    # Define special tokens for GPT-2
-    spk_token = "[SPK]"  # Speaker marker for dialogue
-    # Note: We use <|endoftext|> (GPT-2's native EOS token) for document boundaries
-    eod_token = "<|endoftext|>"  # Document boundary marker
-
     if args.sanitize:
         # Sanitize the chunks in the cache directory
         print(f"Sanitizing chunks...")
@@ -353,7 +531,7 @@ def main():
         return
     
     prepare_data(
-        config, config["cache_path"], sentence_pack=args.sentence_pack
+        config, tokenizer=AutoTokenizer.from_pretrained(config["tokenizer_path"])
     )
 
 if __name__ == "__main__":
@@ -402,7 +580,8 @@ def load_or_prepare_dataset(config: dict, logger=None):
     # Prepare new dataset
     if logger:
         logger.info("Preparing new dataset...")
-    ds = prepare_data(config)
+    tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
+    ds = prepare_data(config, tokenizer, prefixes=True)
     
     # Try to save for future use
     try:
