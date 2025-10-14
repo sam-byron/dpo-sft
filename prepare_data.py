@@ -132,26 +132,7 @@ class GPTDataset(Dataset):
                         take = min(word_count//3, 10)
                         sentences.append(' '.join(sent.split()[:take]))
 
-                return sentences
-    
-def load_md_files_to_dataset(data_dir):
-    """Load all .md files as complete file contents, not line by line"""
-    pattern = os.path.join(data_dir, "**/*.md")
-    md_files = glob.glob(pattern, recursive=True)
-    print(f"Found {len(md_files)} .md files")
-    
-    texts = []
-    for file_path in md_files:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if content:  # Only add non-empty content
-                    texts.append(content)
-        except Exception as e:
-            print(f"Warning: Could not read {file_path}: {e}")
-    
-    print(f"Loaded {len(texts)} text segments (complete files)")
-    return Dataset.from_dict({"text": texts})
+            return sentences
 
 def iter_raw_lines(data_dir):
     pattern = os.path.join(data_dir, "**/*.md")
@@ -340,7 +321,7 @@ def prepare_data(config, tokenizer, prefixes=False):
     buffer_block_metas: list[dict] = []
     file_index = 0
 
-    def flush_file(final=False):
+    def flush_file(final=False, prefixes=False):
         nonlocal buffer_blocks, buffer_block_metas, file_index
         if not buffer_blocks:
             return
@@ -402,7 +383,7 @@ def prepare_data(config, tokenizer, prefixes=False):
                     total_blocks += 1
                     oversize_split_segments += 1
                     if len(buffer_blocks) >= blocks_per_file:
-                        flush_file()
+                        flush_file(prefixes=prefixes)
                     start += block_size
                 continue
             else:  # raise
@@ -423,10 +404,10 @@ def prepare_data(config, tokenizer, prefixes=False):
         })
         total_blocks += 1
         if len(buffer_blocks) >= blocks_per_file:
-            flush_file()
+            flush_file(prefixes=prefixes)
 
     # Final flush
-    flush_file(final=True)
+    flush_file(final=True, prefixes=prefixes)
 
     avg_fill = total_tokens_before_padding / (total_blocks * block_size) if total_blocks else 0.0
     print("[BlockWriter][Summary]")
@@ -437,10 +418,7 @@ def prepare_data(config, tokenizer, prefixes=False):
     print(f"  Oversize split pieces emitted: {oversize_split_segments}")
     print(f"  Oversize truncated segments: {oversize_truncated_segments}")
     print(f"  Files written: {file_index}")
-    return total_blocks
-
-
-    return ds
+    return total_blocks, ds
 
 
 def check_chunk_file(path):
@@ -581,7 +559,7 @@ def load_or_prepare_dataset(config: dict, logger=None):
     if logger:
         logger.info("Preparing new dataset...")
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
-    ds = prepare_data(config, tokenizer, prefixes=True)
+    total_blocks, ds = prepare_data(config, tokenizer, prefixes=True)
     
     # Try to save for future use
     try:
