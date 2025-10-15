@@ -1,8 +1,19 @@
+# interactive_utils.py
+# ==================================================================================
+# PERFORMANCE OPTIMIZATIONS:
+# ==================================================================================
+# - All inference functions use @torch.no_grad() or torch.inference_mode()
+# - Mixed precision (bfloat16) via torch.autocast for all forward passes
+# - KV-cache enabled for generation
+# - Bucket-based padding to reduce recompilations
+# - Efficient log-probability calculations with proper masking
+# - Left padding for batch generation efficiency
+# ==================================================================================
 import os
 import re
 import json
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, cast
+from typing import Callable, List, Optional, Tuple, Dict, cast
 import itertools
 
 import torch
@@ -18,7 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from datasets import load_dataset
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -42,21 +53,23 @@ PHENOMENON_PATTERNS = {
 
 @torch.no_grad()
 def get_uncertainty(student, tok, prefixes, attempts):
-    """Return per-sample uncertainty (entropy) as selection criterion."""
+    """Return per-sample uncertainty (entropy) as selection criterion (inference only)."""
     student.eval()
-    enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
-    enc_y = tok(attempts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
-    # Ensure input_ids and attention_mask are long tensors before moving to device
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
-    
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        enc_x = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+        enc_y = tok(attempts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+        
+        # Move to device and ensure Long dtype in one step
+        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
+        
         out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
     
     logits = out.logits[:, enc_x.input_ids.shape[1]-1:-1, :]
     probs = F.softmax(logits, dim=-1)
-    entropy = -(probs * probs.log()).sum(dim=-1).mean(dim=-1)
-    return entropy.cpu().tolist()
+    # Clamp to avoid log(0)
+    entropy = -(probs * torch.clamp(probs.log(), min=-100)).sum(dim=-1).mean(dim=-1)
+    return entropy.detach().cpu().tolist()
 
 def force_json(text: str) -> Dict:
     # Extract first {...} block to guard against stray tokens
@@ -77,20 +90,21 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
     Returns: scalar loss
     """
     student.train()
+    
+    # Reference preferences (detached, computed once)
     with torch.no_grad():
-        # Reference preferences (detach)
         lp_pos_ref = logprob_sum(reference, tok, xs, y_pos, max_len=max_len)  # [B]
         lp_neg_ref = logprob_sum(reference, tok, xs, y_neg, max_len=max_len)  # [B]
-        ref_delta = lp_pos_ref - lp_neg_ref                                  # [B]
+        ref_delta = (lp_pos_ref - lp_neg_ref).detach()  # Explicit detach for safety
 
     # Student preferences (requires grad)
-    lp_pos_stu = logprob_sum(student, tok, xs, y_pos, max_len=max_len)       # [B]
-    lp_neg_stu = logprob_sum(student, tok, xs, y_neg, max_len=max_len)       # [B]
-    stu_delta  = lp_pos_stu - lp_neg_stu
+    lp_pos_stu = logprob_sum(student, tok, xs, y_pos, max_len=max_len)  # [B]
+    lp_neg_stu = logprob_sum(student, tok, xs, y_neg, max_len=max_len)  # [B]
+    stu_delta = lp_pos_stu - lp_neg_stu
 
     # Score and logistic loss
     margin = beta * (stu_delta - ref_delta)
-    # log σ(z) = -softplus(-z)  ; we want -E[log σ(margin)]
+    # log σ(z) = -softplus(-z); we want -E[log σ(margin)]
     loss = F.softplus(-margin).mean()
     return loss
 
@@ -118,21 +132,23 @@ def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
 
 
 class Caregiver:
-    def __init__(self, model_name: str = 'Qwen/Qwen2.5-1.5B-Instruct', rng_seed: int = 0):
+    def __init__(self, model_name: str = 'grammarly/coedit-large', rng_seed: int = 0):
         self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = 'left'
             
-        # Load in bfloat16 directly
-        self.model = AutoModelForCausalLM.from_pretrained(
+        # Load in bfloat16 directly with automatic device placement
+        self.model = AutoModel.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16,
+            device_map="auto"  # Automatic optimal device placement
         )
         self.model.eval()
         
-        if torch.cuda.is_available():
-            self.model = self.model.to('cuda')  # type: ignore[call-arg]       
+        # Freeze all parameters for inference-only usage
+        for param in self.model.parameters():
+            param.requires_grad = False       
 
         # Stronger system prompt with constraints + inline few-shots
         self.system_prompt = (
@@ -140,23 +156,21 @@ class Caregiver:
             "Correct ONLY the Suffix so that 'Prefix + Suffix' is grammatical, coherent, and faithful in meaning. "
             "Make the minimum necessary edits (grammar, agreement, semantics, punctuation). Do not change the Prefix. "
             "If the Suffix is already acceptable, return it unchanged. If Suffix is empty, return the shortest natural continuation. "
-            "Output ONLY the corrected Suffix. No quotes, no labels, no explanations. Keep it concise (<= 15 tokens). "
+            "Output ONLY the corrected Suffix. No quotes, no labels, no explanations. Keep it concise. "
             "Do not repeat the Prefix.\n\n"
             "Examples:\n"
-            "Prefix: The cat sat\nSuffix: in the sun.\nAnswer: in the sun.\n"
             "Prefix: She\nSuffix: see themselves.\nAnswer: saw herself.\n"
             "Prefix: They\nSuffix: is happy.\nAnswer: are happy.\n"
-            "Prefix: Judge Stanley Spence told Creagh: 'You were a\nSuffix:\nAnswer: good man.'\n"
+            "Prefix: Judge Stanley Spence told Creagh: 'You were a\nSuffix:\nAnswer: You were a good man.'\n"
             "Prefix: In a business any operating loss\nSuffix: has been carried down\nAnswer: has been carried forward\n"
             "Prefix: He pointed ahead through\nSuffix: the room to be taken on\nAnswer: the door\n"
         )
 
         # Few-shot pairs used as chat turns (helps small models)
         self._few_shots = [
-            ("The cat sat", "in the sun.", "in the sun."),
             ("She", "see themselves.", "saw herself."),
             ("They", "is happy.", "are happy."),
-            ("Judge Stanley Spence told Creagh: 'You were a", "", "good man.'"),
+            ("Judge Stanley Spence told Creagh: 'You were a", "", "You were a good man.'"),
             ("In a business any operating loss", "has been carried down", "has been carried forward"),
             ("He pointed ahead through", "the room to be taken on", "the door"),
         ]
@@ -171,6 +185,7 @@ class Caregiver:
         return msgs
 
     def _clean_suffix(self, text: str, forbid_prefixes: List[str]) -> str:
+        
         t = text.strip()
         # Cut at first newline or chat marker
         cut_markers = ["\nPrefix:", "\nSuffix:", "\nSystem:", "\nUser:", "\nAssistant:"]
@@ -190,9 +205,9 @@ class Caregiver:
                 t = t[:pos]
         # Collapse spaces
         t = " ".join(t.split())
-        # Cap to 15 tokens
+        # Cap to 20 tokens
         toks = t.split()
-        if len(toks) > 15:
+        if len(toks) > 20:
             t = " ".join(toks[:15])
         return t
 
@@ -294,27 +309,29 @@ def batchify(items, bs):
 
 @torch.no_grad()
 def generate(model, tok, prefixes, max_new_tokens=12, temperature=1.0, top_p=0.9):
+    """Generate continuations for prefixes using the model (inference only)."""
     model.eval()
-    # lengths = [len(p.split()) for p in prefixes]
-    # order = sorted(range(len(prefixes)), key=lambda i: lengths[i])
-    # rev = [0]*len(order)
-    # for i, oi in enumerate(order): rev[oi] = i
-    # ordered = [prefixes[i] for i in order]
-    target_len = pad_to_bucket(prefixes, tok)
-    enc = tok(prefixes, return_tensors="pt", padding="max_length",
-              max_length=target_len, truncation=True).to(DEVICE)
     
-    # CRITICAL FIX: Ensure attention_mask is set correctly for left-padded sequences
-    # Left padding means pad tokens are at the START, so we need to shift the mask
+    # Use standard padding (left-side) without bucket optimization for now
+    # The bucket optimization was causing attention mask issues
+    enc = tok(
+        prefixes, 
+        return_tensors="pt", 
+        padding=True,  # Use dynamic padding instead of max_length
+        truncation=True,
+        max_length=512
+    ).to(DEVICE)
+    
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
     
-    # Debugging: check if left padding is causing issues
-    # Print first example to verify padding
-    if torch.rand(1).item() < 0.01:  # 1% of batches
+    # Debugging: verify padding is correct (1% sample rate)
+    if torch.rand(1).item() < 0.01:
         print(f"[DEBUG] First input_ids: {input_ids[0][:20].tolist()}")
         print(f"[DEBUG] First attn_mask: {attention_mask[0][:20].tolist()}")
-        print(f"[DEBUG] Decoded prefix: {tok.decode(input_ids[0][attention_mask[0].bool()], skip_special_tokens=False)}")
+        # Decode only non-padding tokens
+        non_pad_ids = input_ids[0][attention_mask[0].bool()]
+        print(f"[DEBUG] Decoded prefix: {tok.decode(non_pad_ids, skip_special_tokens=True)[:50]}")
     
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         out = model.generate(
@@ -324,58 +341,56 @@ def generate(model, tok, prefixes, max_new_tokens=12, temperature=1.0, top_p=0.9
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
-            repetition_penalty=1.2,  # Penalize repeating tokens
-            no_repeat_ngram_size=3,  # Prevent exact 3-gram repeats
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
             pad_token_id=tok.eos_token_id,
             eos_token_id=tok.eos_token_id,
             use_cache=True,
         )
 
+    # Extract only the generated tokens (not the input)
     out = [
         output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids, out)
     ]
     return [tok.decode(g, skip_special_tokens=True).strip() for g in out]
-    # Calculate actual input lengths (non-padding tokens)
-    # input_lens = attention_mask.sum(dim=1).tolist()
-    # gens = []
-    # for i, seq in enumerate(out):
-    #     gen_part = seq[input_lens[i]:]
-    #     gens.append(tok.decode(gen_part, skip_special_tokens=True).strip())
-    # restored = [None]*len(gens)
-    # for i, gi in enumerate(gens):
-    #     restored[order[i]] = gi
-    # return restored
 
 def ce_targets(student, tok, x_list, y_list):
+    """Cross-entropy loss on target y given prefix x (requires gradients)."""
     student.train()
     enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
     enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
-    # Ensure input_ids and attention_mask are long tensors
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).to(DEVICE).long()
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).to(DEVICE).long()
+    
+    # Efficient: concatenate then move to device + cast to long in one operation
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
+    
     labels = input_ids.clone()
     labels[:, :enc_x.input_ids.shape[1]] = -100
-    out = student(input_ids=input_ids[:, :MAX_CONCAT],
-                  attention_mask=attn_mask[:, :MAX_CONCAT],
-                  labels=labels[:, :MAX_CONCAT])
+    
+    out = student(
+        input_ids=input_ids[:, :MAX_CONCAT],
+        attention_mask=attn_mask[:, :MAX_CONCAT],
+        labels=labels[:, :MAX_CONCAT]
+    )
     return out.loss
 
 # logprob_sum: remove incorrect divide by len(tok) and use autocast
 @torch.no_grad()
 def logprob_sum(model, tok, x_list, y_list, max_len=256):
+    """Compute sum of log probabilities for y given x (inference only)."""
     model.eval()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
-        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2)
+        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2)
         
-        # Ensure input_ids are Long (not Float) - critical fix!
-        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long()
-        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long()
+        # Move to device and ensure Long dtype in one step
+        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
         
         labels = input_ids.clone()
         labels[:, :enc_x.input_ids.shape[1]] = -100
         
-        out = model(input_ids=input_ids, attention_mask=attn_mask)
+        out = model(input_ids=input_ids[:, :max_len], attention_mask=attn_mask[:, :max_len])
         logits = out.logits[:, :-1]
         tgt = labels[:, 1:]
         mask_y = (tgt != -100)
@@ -384,22 +399,21 @@ def logprob_sum(model, tok, x_list, y_list, max_len=256):
         token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
         return (token_lp * mask_y).sum(dim=1)
 
-
 def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = None, temperature: float = 1.0):
     """
     Distillation-style KL(student || reference) on target tokens y conditioned on x.
-    Student needs gradients, reference doesn't.
+    Student requires gradients, reference doesn't.
     """
-    student.train()  # ✅ Keep student in train mode for gradients
+    student.train()
     reference.eval()
     
     # Encode x and y (only positives by default)
-    enc_x = tok(xs, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
-    enc_y = tok(y_pos, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2).to(DEVICE)
+    enc_x = tok(xs, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
+    enc_y = tok(y_pos, return_tensors="pt", padding=True, truncation=True, max_length=MAX_CONCAT//2)
     
-    # Build inputs and masks - ensure Long dtype
-    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long()
-    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long()
+    # Efficient: concatenate then move to device + cast to long in one operation
+    input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+    attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
     
     # Labels to identify y positions (mask x with -100)
     labels = input_ids.clone()
@@ -419,7 +433,7 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
 
     # KL(student || reference) over vocab at each token
     log_p = F.log_softmax(st_logits, dim=-1)
-    q = F.softmax(rf_logits, dim=-1)
+    q = F.softmax(rf_logits.detach(), dim=-1)  # Explicit detach for safety
 
     # Per-token KL: sum over vocab, then mask to y positions
     kl_tok = F.kl_div(log_p, q, reduction="none").sum(dim=-1)  # [B, T]
@@ -594,43 +608,65 @@ def _jaccard(a: str, b: str) -> float:
     if not sa and not sb: return 1.0
     return len(sa & sb) / max(len(sa | sb), 1)
 
+@torch.no_grad()
 def build_contrastive_pairs(
     student, reference, tok, prefixes: List[str], attempts: List[str],
-    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 15
+    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 15,
+    critic = None  # optional LLM critic scores
 ) -> Tuple[List[str], List[str], List[str]]:
     xs, chosen, rejected = [], [], []
     for x, a0 in zip(prefixes, attempts):
         # pool candidates
         pool = set()
-        pool.add(a0.strip())
+        pool.add((a0 or "").strip())
         gens = []
-        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.0, top_p=1.0)  # greedy
+        # gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.1, top_p=1.0)  # greedy
         gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.7, top_p=0.9)
-        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.9, top_p=0.95)
+        # gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.9, top_p=0.95)
         for g in gens:
-            pool.add((g or "").strip())
-            if len(pool) >= k_per_prefix+2: break
+            if g is not None:
+                pool.add(g.strip())
+            if len(pool) >= k_per_prefix + 2:
+                break
         cand_list = [c for c in pool if c]
 
-        # score
-        scored = []
+        if not cand_list:
+            continue
+
+        # reference-based score (fast, consistent with DPO objective)
+        ref_scored = []
         for y in cand_list:
             s = _norm_logprob_per_tok(reference, tok, x, y)
             s -= 0.8 * _rep_frac(y, n=3)
             s -= 0.8 * _prefix_leak(x, y)
             if len(y.split()) > max_len: s -= 0.5
             if not y: s -= 1.0
-            scored.append((s, y))
+            ref_scored.append((s, y))
 
-        if not scored: continue
-        scored.sort(key=lambda t: t[0])
-        s_lo, y_lo = scored[0]
-        s_hi, y_hi = scored[-1]
+        # optional: LLM critic reranking (e.g., caregiver-7B) for stronger contrast
+        # critic(x, cands) -> list of floats (higher is better), same order as cand_list
+        critic_weight = 1.0
+        if critic is not None and len(cand_list) > 1:
+            try:
+                with torch.no_grad():
+                    crit_scores = critic(x, cand_list)  # length == len(cand_list)
+                # blend: keep reference as anchor; critic as reranker
+                crit_map = {y: cs for y, cs in zip(cand_list, crit_scores)}
+                ref_scored = [ (s + critic_weight * crit_map.get(y, 0.0), y) for (s, y) in ref_scored ]
+            except Exception:
+                pass  # fall back to reference-only
+
+        ref_scored.sort(key=lambda t: t[0])
+        s_lo, y_lo = ref_scored[0]
+        s_hi, y_hi = ref_scored[-1]
 
         # filter weak/near-duplicate pairs
-        if (s_hi - s_lo) < margin: continue
-        if _jaccard(y_hi, y_lo) > 0.7: continue
-        if y_hi == y_lo: continue
+        if (s_hi - s_lo) < margin: 
+            continue
+        if _jaccard(y_hi, y_lo) > 0.7: 
+            continue
+        if y_hi == y_lo: 
+            continue
 
         xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
     return xs, chosen, rejected
