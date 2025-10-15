@@ -1,0 +1,80 @@
+{
+
+  "block_size": 128,
+  "num_epochs": 8,
+
+  "model_name": "gpt2",
+  "model_config_path": "./configs/gpt2/config.json",
+
+  "_batching_notes": "Per-GPU batch_size * grad_accum * world_size = effective sequences per optimizer update",
+ "batch_size": 640,
+  "grad_accum": 12,
+  "_world_size_hint": 3,
+  "_effective_sequences_per_update": 9216,
+  "_effective_tokens_per_update": 1179648,
+  "_packing_metadata": {
+    "terminal_end_rate_estimate": 0.90,
+    "dangling_carried_rate_estimate": 0.16,
+    "borrow_move_rate_estimate": 0.001,
+    "short_trailing_drop_rate_estimate": 0.0,
+    "notes": "Packing stats were computed at 512 context; training run here fixed to 128 block_size for experimental ablation."
+  },
+
+  "vocab_size": 16000,
+  "dataset_split": "train",
+  "tokenizer_path": "./model_babylm_gpt2_16k",
+  "oversize_policy": "split",
+
+
+  "data_split_seed": 80,
+
+  "optimizer": "adamw",
+  "learning_rate": 5e-5,
+  "lr_scale_alpha": 0.3,
+  "peak_lr_cap": 1e-4,
+  "min_lr": 1e-5,
+  "warmup_steps_proportion": 0.05,
+  "optimizer_eps": 1e-6,
+  "weight_decay": 0.05,
+  "head_weight_decay": 0.1,
+  "max_grad_norm": 1.0,
+
+  "train_frac": 0.8,
+  "val_frac":0.05,
+
+  "reinitialize_scheduler": false,
+
+  "attention_probs_dropout_prob": 0.1,
+  "hidden_dropout_prob": 0.1,
+
+  "hidden_size": 768,
+  "intermediate_size": 2048,
+  "num_attention_heads": 12,
+  "num_hidden_layers": 12,
+  "position_bucket_size": 32,
+  "layer_norm_eps": 1e-5,
+  "share_layer_weights": false,
+
+  "merge_test_into_val": false,
+
+  "checkpoint_path": "model_babylm_gpt2_80M_bs128_checkpoint",
+  "cache_path": "model_babylm_gpt2_80M_bs128",
+  "finetune_path": "model_babylm_gpt2/finetune",
+  "max_position_embeddings": 1024,
+  "model_max_length": 1024,
+  "chunk_size": 10000,
+
+  "monitoring": {
+    "spike_threshold": 0.6,
+    "oscillation_threshold": 0.3,
+    "window_size": 100
+  },
+
+  "_curriculum_note": "Train with block_size 128 for first 90% of steps; unfreeze 512-length curriculum last 10% by switching dataloader block_size while model already has 512 positional capacity.",
+  "_inference": {
+    "max_new_tokens": 400,
+    "max_response_length": 150,
+    "temperature": 0.9,
+    "top_p": 0.8
+  }
+}
