@@ -350,16 +350,27 @@ def main():
 
     step = 0
     step_times = {"data": 0.0, "generate": 0.0, "correct": 0.0, "forward": 0.0, "backward": 0.0}
+    # Running average (EMA) for loss displayed in tqdm
+    avg_loss = None
+    avg_decay = 0.98  # higher = smoother
     
     # Caregiver audit: log corrections every 25 steps
     audit_path = os.path.join(args.save_dir, "caregiver_audit.json")
-    critic_name = 'Qwen/Qwen2.5-1.5B-Instruct'
-    # Load in bfloat16 directly for faster inference
-    critic = AutoModelForCausalLM.from_pretrained(
-        critic_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"  # Automatic device placement
-    )
+    critic_name = 'grammarly/coedit-large'
+    # Load critic (prefer causal LM; fallback to seq2seq if needed)
+    try:
+        critic = AutoModelForCausalLM.from_pretrained(
+            critic_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    except Exception:
+        from transformers import AutoModelForSeq2SeqLM
+        critic = AutoModelForSeq2SeqLM.from_pretrained(
+            critic_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
     critic.eval()
     for p in critic.parameters():
         p.requires_grad = False
@@ -477,7 +488,8 @@ def main():
         L_sft = ce_targets(student, tokenizer, prefixes, y_star)
         L_kl  = kl_to_ref(student, reference, tokenizer, prefixes, attempts)  # ✅ Use attempts, not y_star
         L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
-        do_dpo = args.use_dpo and (step % dpo_interval == 0)
+        # do_dpo = args.use_dpo and (step % dpo_interval == 0)
+        do_dpo = True
 
         if do_dpo:
             xs, chosen, rejected = build_contrastive_pairs(
@@ -485,17 +497,24 @@ def main():
                 k_per_prefix=6, margin=0.4, max_len=15, critic=critic
             )
             if xs and chosen and rejected:
-                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=2.0)
+                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.5)
                 last_L_dpo = L_dpo.detach()
+        else:
+            # Use last computed DPO loss for smoother loss
+            L_dpo = last_L_dpo.detach()
 
         # Amortize and ramp DPO weight to avoid spikes
-        base_dpo_weight = (1.0 / dpo_interval) if args.use_dpo else 0.0
+        base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
         ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
         dpo_weight = base_dpo_weight * ramp
 
         # --- Combine losses (final total) ---
-        loss = L_sft + 0.5 * L_kl + dpo_weight * L_dpo
+        loss = L_sft + 0.75 * L_kl + dpo_weight * L_dpo
         step_times["forward"] += time.time() - forward_start
+
+        # Update running average (EMA)
+        loss_val = float(loss.item())
+        avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
 
         backward_start = time.time()
         opt.zero_grad(set_to_none=True)
@@ -513,15 +532,16 @@ def main():
         # Update progress bar with current metrics (ensure all losses are shown)
         current_lr = sched.get_last_lr()[0]
         
-        # Use dictionary method for progress bar updates
+        # Use dictionary method for progress bar updates (order matters in tqdm)
+        # Show running average first; remove Corr from the bar
         progress_metrics = {
-            "Loss": f"{loss.item():.3f}",
+            "Avg": f"{avg_loss:.3f}",
+            "Loss": f"{loss_val:.3f}",
             "SFT": f"{L_sft.item():.3f}",
-            "KL": f"{L_kl.item():.3f}", 
+            "KL": f"{L_kl.item():.3f}",
             "DPO": f"{(dpo_weight * (L_dpo if do_dpo else last_L_dpo)).item():.3f}",
             "LR": f"{current_lr:.1e}",
-            "Corr": f"{n_correct}/{len(prefixes)}",
-            "Words": f"{budget.used/1e6:.1f}M"
+            "Words": f"{budget.used/1e6:.1f}M",
         }
         logger.update_progress(step, **progress_metrics)
 
