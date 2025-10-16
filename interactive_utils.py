@@ -29,7 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from datasets import load_dataset
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -132,15 +132,15 @@ def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
 
 
 class Caregiver:
-    def __init__(self, model_name: str = 'grammarly/coedit-large', rng_seed: int = 0):
+    """Caregiver model that provides text-based corrections without JSON."""
+    def __init__(self, model_name: str = 'Qwen/Qwen2.5-1.5B-Instruct', rng_seed: int = 0):
         self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = 'left'
             
-        # Load as Seq2Seq model (T5-based), not as AutoModel
-        from transformers import AutoModelForSeq2SeqLM
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+        # Load in bfloat16 directly
+        self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto"
@@ -157,48 +157,62 @@ class Caregiver:
         combined = f"{prefix} {suffix}".strip()
         return f"Fix grammatical errors: {combined}"
 
+    # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
     def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
-        """Batch correction using encoder-decoder (T5-style) model."""
+        # prompt = f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected version of the second half such that the sentence requires the minimal number of edits. Provide one sentence only.\nCorrected version:"
+
+        prompts = [
+           f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected " 
+           "version of the second half such that the sentence requires the minimal number of edits. You must preserves the first half exactly. "
+           "Provide one sentence only.\nCorrected version:"
+            for p, s in zip(prefixes, students)
+        ]
         self.model.eval()
+        self.tok.padding_side = "left"
+        chat_payloads = self.tok.apply_chat_template(
+            [[
+                {"role": "system", "content": "You are a teacher."},
+                {"role": "user", "content": p}
+            ] for p in prompts],
+            tokenize=False,
+            add_generation_prompt=True,
+            # padding_side="left"
+        )
         
-        # Build prompts
-        prompts = [self._build_prompt(p, s) for p, s in zip(prefixes, students)]
-        
-        # Encode inputs
-        enc = self.tok(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        ).to(DEVICE)
-
+        # Bucketed padding
+        # target_len = pad_to_bucket(chat_payloads, self.tok, buckets=[64, 128, 256])
+        tok_chat_payload = self.tok(chat_payloads, return_tensors="pt", padding=True, truncation=True)
+        # dyn = {k: v.to('cuda') for k, v in tok_chat_payload.items()}
+        # tok_chat_payload.to('cuda')
+        # Move to device once
+        input_ids = tok_chat_payload.input_ids.to(DEVICE)
+        attention_mask = tok_chat_payload.attention_mask.to(DEVICE)
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-            out_ids = self.model.generate(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                max_new_tokens=64,  # Allow longer outputs for T5
-                num_beams=1,        # Greedy for speed
-                repetition_penalty=1.05,
-                no_repeat_ngram_size=3,
-                eos_token_id=self.tok.eos_token_id,
-                pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id,
-            )
+            generated_ids = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=20,
+            eos_token_id=self.tok.eos_token_id,
+            pad_token_id=self.tok.pad_token_id,
+            do_sample=True,
+            # temperature=0.7,
+            # top_p=0.9,
+            # repetition_penalty=1.1,
+            # early_stopping=True,
+        )
+        
+        generated_ids = [
+            output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids
+        , generated_ids)
+        ]
 
-        # Decode generated outputs
-        texts = self.tok.batch_decode(out_ids, skip_special_tokens=True)
+        responses = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
+        results = []
+        # Parse each response
+        for response, student in zip(responses, students):
+            results.append(parse_caregiver_text(response, student.strip()))
         
-        # Extract just the corrected suffix (remove prefix if model echoed it)
-        cleaned = []
-        for text, prefix in zip(texts, prefixes):
-            # Remove prefix if present
-            if text.startswith(prefix):
-                text = text[len(prefix):].strip()
-            # Clean up
-            text = " ".join(text.split())
-            cleaned.append(text)
-        
-        return [CaregiverOutput(c) for c in cleaned]
+        return results
 
     def correct(self, prefix: str, student: str) -> CaregiverOutput:
         """Single correction."""
@@ -317,12 +331,12 @@ def ce_targets(student, tok, x_list, y_list):
 
 # logprob_sum: remove incorrect divide by len(tok) and use autocast
 @torch.no_grad()
-def logprob_sum(model, tok, x_list, y_list, max_len=256):
+def logprob_sum(model, tok, x_list, y_list, max_len=1024):
     """Compute sum of log probabilities for y given x (inference only)."""
     model.eval()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2)
-        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2)
+        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
         
         # Move to device and ensure Long dtype in one step
         input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
