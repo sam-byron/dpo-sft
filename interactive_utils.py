@@ -660,64 +660,70 @@ def _jaccard(a: str, b: str) -> float:
 def build_contrastive_pairs(
     student, reference, tok, prefixes: List[str], attempts: List[str],
     k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 20,
-    critic = None  # optional LLM critic scores
+    critic = None, audit_path = None
 ) -> Tuple[List[str], List[str], List[str]]:
     xs, chosen, rejected = [], [], []
     student.eval()
     reference.eval()
-    for x, a0 in zip(prefixes, attempts):
-        # pool candidates
-        pool = set()
-        pool.add((a0 or "").strip())
-        gens = []
-        # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.1, fast_sample=True)  # greedy
-        gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
-        # gens += complete(student, tok, [x], max_new_tokens=max_len, fast_sample=True)
-        for g in gens:
-            if g is not None:
-                pool.add(g.strip())
-            if len(pool) >= k_per_prefix + 2:
-                break
-        cand_list = [c for c in pool if c]
+    
+    # Open audit file if path provided
+    audit_file = None
+    if audit_path:
+        audit_file = open(audit_path, 'a', encoding='utf-8')
+    
+    try:
+        for x, a0 in zip(prefixes, attempts):
+            # pool candidates
+            pool = set()
+            pool.add((a0 or "").strip())
+            gens = []
+            gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
+            for g in gens:
+                if g is not None:
+                    pool.add(g.strip())
+                if len(pool) >= k_per_prefix + 2:
+                    break
+            cand_list = [c for c in pool if c]
 
-        if not cand_list:
-            continue
+            if not cand_list:
+                continue
 
-        # critic-based score
-        ref_scored = []
-        for y in cand_list:
-            s = _norm_logprob_per_tok(critic, tok, x, y)
-            # s -= 0.8 * _rep_frac(y, n=3)
-            # s -= 0.8 * _prefix_leak(x, y)
-            # if len(y.split()) > max_len: s -= 0.5
-            # if not y: s -= 1.0
-            ref_scored.append((s, y))
+            # critic-based score
+            ref_scored = []
+            for y in cand_list:
+                s = _norm_logprob_per_tok(critic, tok, x, y)
+                ref_scored.append((s, y))
 
-        # optional: LLM critic reranking (e.g., caregiver-7B) for stronger contrast
-        # critic(x, cands) -> list of floats (higher is better), same order as cand_list
-        # critic_weight = 0.5
-        # # critic = None  # disable for now
-        # if critic is not None and len(cand_list) > 1:
-        #     try:
-        #         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        #             crit_scores = critic(x, cand_list)  # length == len(cand_list)
-        #         # blend: keep reference as anchor; critic as reranker
-        #         crit_map = {y: cs for y, cs in zip(cand_list, crit_scores)}
-        #         ref_scored = [ (s + critic_weight * crit_map.get(y, 0.0), y) for (s, y) in ref_scored ]
-        #     except Exception:
-        #         pass  # fall back to reference-only
+            ref_scored.sort(key=lambda t: t[0])
+            
+            # Write audit record - one candidate per line
+            if audit_file:
+                # Write prefix header
+                audit_file.write(f"PREFIX: {x}\n")
+                
+                # Write each candidate on its own line
+                for i, (s, y) in enumerate(ref_scored):
+                    audit_file.write(f"  RANK {i+1} | SCORE {s:.4f} | TEXT: {y}\n")
+                
+                # Add separator between prefix groups
+                audit_file.write("\n")
+                audit_file.flush()  # Ensure written immediately
+            
+            s_lo, y_lo = ref_scored[0]
+            s_hi, y_hi = ref_scored[-1]
 
-        ref_scored.sort(key=lambda t: t[0])
-        s_lo, y_lo = ref_scored[0]
-        s_hi, y_hi = ref_scored[-1]
-
-        # filter weak/near-duplicate pairs
-        if (s_hi - s_lo) < margin: 
-            continue
-        if _jaccard(y_hi, y_lo) > 0.7: 
-            continue
-        if y_hi == y_lo: 
-            continue
-        student.train()
-        xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
+            # filter weak/near-duplicate pairs
+            if (s_hi - s_lo) < margin: 
+                continue
+            if _jaccard(y_hi, y_lo) > 0.7: 
+                continue
+            if y_hi == y_lo: 
+                continue
+            student.train()
+            xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
+    
+    finally:
+        if audit_file:
+            audit_file.close()
+    
     return xs, chosen, rejected

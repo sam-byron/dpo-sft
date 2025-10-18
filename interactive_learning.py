@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--model_path", type=str, default=None, help="Optional path to a LoRA adapter directory (with adapter_config.json) to load and merge into base using load_lora.py. If provided, overrides --model_name.")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--use_dpo", action="store_true")
     ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--save_dir", type=str, default="./ckpts_bnc_interactive")
@@ -434,7 +434,7 @@ def main():
 
             xs, chosen, rejected = build_contrastive_pairs(
                 student, reference, tokenizer, prefixes_subset, attempts_subset,
-                k_per_prefix=3, margin=0.6, max_len=12, critic=critic
+                k_per_prefix=3, margin=0.6, max_len=12, critic=critic, audit_path=audit_path
             )
             if xs and chosen and rejected:
                 L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.1)
