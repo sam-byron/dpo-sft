@@ -29,7 +29,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from datasets import load_dataset
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, T5ForConditionalGeneration, AutoConfig
 from peft import LoraConfig, get_peft_model
 
 # Import the color logger
@@ -51,7 +51,7 @@ PHENOMENON_PATTERNS = {
     "entity":     re.compile(r".*\bMary told John\b.*"),
 }
 
-@torch.no_grad()
+# @torch.no_grad()
 def get_uncertainty(student, tok, prefixes, attempts):
     """Return per-sample uncertainty (entropy) as selection criterion (inference only)."""
     student.eval()
@@ -69,6 +69,7 @@ def get_uncertainty(student, tok, prefixes, attempts):
     probs = F.softmax(logits, dim=-1)
     # Clamp to avoid log(0)
     entropy = -(probs * torch.clamp(probs.log(), min=-100)).sum(dim=-1).mean(dim=-1)
+    student.train()
     return entropy.detach().cpu().tolist()
 
 def force_json(text: str) -> Dict:
@@ -90,17 +91,18 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
     Returns: scalar loss
     """
     student.train()
+    reference.eval()
+
+    # Student preferences (requires grad)
+    lp_pos_stu = logprob_sum_with_grad(student, tok, xs, y_pos, max_len=max_len)  # [B]
+    lp_neg_stu = logprob_sum_with_grad(student, tok, xs, y_neg, max_len=max_len)  # [B]
+    stu_delta = lp_pos_stu - lp_neg_stu
     
     # Reference preferences (detached, computed once)
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         lp_pos_ref = logprob_sum(reference, tok, xs, y_pos, max_len=max_len)  # [B]
         lp_neg_ref = logprob_sum(reference, tok, xs, y_neg, max_len=max_len)  # [B]
         ref_delta = (lp_pos_ref - lp_neg_ref).detach()  # Explicit detach for safety
-
-    # Student preferences (requires grad)
-    lp_pos_stu = logprob_sum(student, tok, xs, y_pos, max_len=max_len)  # [B]
-    lp_neg_stu = logprob_sum(student, tok, xs, y_neg, max_len=max_len)  # [B]
-    stu_delta = lp_pos_stu - lp_neg_stu
 
     # Score and logistic loss
     margin = beta * (stu_delta - ref_delta)
@@ -130,81 +132,136 @@ def parse_caregiver_text(text: str, student_fallback: str) -> CaregiverOutput:
     
     return CaregiverOutput(" ".join(text.split()))
 
+def is_causal_lm(model_name: str) -> bool:
+    """Check if a model is a causal language model based on its config."""
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        # Check if it's a decoder-only (causal) model
+        return getattr(config, 'is_decoder', True) and not getattr(config, 'is_encoder_decoder', False)
+    except Exception:
+        return False
 
+def is_seq2seq(model_name: str) -> bool:
+    """Check if a model is a sequence-to-sequence (encoder-decoder) model."""
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        # Check if it's an encoder-decoder model
+        return getattr(config, 'is_encoder_decoder', False)
+    except Exception:
+        return False
 class Caregiver:
     """Caregiver model that provides text-based corrections without JSON."""
     def __init__(self, model_name: str = 'Qwen/Qwen2.5-1.5B-Instruct', rng_seed: int = 0):
-        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        if self.tok.pad_token is None:
-            self.tok.pad_token = self.tok.eos_token
-        self.tok.padding_side = 'left'
-            
-        # Load in bfloat16 directly
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
-        )
+
+        if is_causal_lm(model_name):
+            self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+            if self.tok.pad_token is None:
+                self.tok.pad_token = self.tok.eos_token
+            self.tok.padding_side = 'left'
+
+            # Load in bfloat16 directly
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto"
+            )
+        elif is_seq2seq(model_name):
+            self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+            if self.tok.pad_token is None:
+                self.tok.pad_token = self.tok.eos_token
+            self.tok.padding_side = 'right'
+            self.model = T5ForConditionalGeneration.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto"
+            )
+        else:
+            raise ValueError(f"Model {model_name} is neither a causal LM nor a seq2seq model.") 
+
         self.model.eval()
         
         # Freeze all parameters for inference-only usage
         for param in self.model.parameters():
             param.requires_grad = False
 
-    def _build_prompt(self, prefix: str, suffix: str) -> str:
+    def _build_prompts(self, prefixes: List[str], suffixes: List[str]) -> list[str]:
         """Build a simple instruction prompt for CoEdit."""
         # CoEdit expects: "Fix grammar: <text>" or "Make this coherent: <text>"
-        combined = f"{prefix} {suffix}".strip()
-        return f"Fix grammatical errors: {combined}"
+        prompts = [
+            f"Fix grammatical errors: {prefix} {suffix}" for prefix, suffix in zip(prefixes, suffixes)  
+        ]
+        return prompts
 
     # Optimize correct_batch to reuse pre-tokenized system and use autocast/inference_mode
     def correct_batch(self, prefixes: List[str], students: List[str]) -> List[CaregiverOutput]:
         # prompt = f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected version of the second half such that the sentence requires the minimal number of edits. Provide one sentence only.\nCorrected version:"
-
-        prompts = [
-           f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected " 
-           "version of the second half such that the sentence requires the minimal number of edits. You must preserves the first half exactly. "
-           "Provide one sentence only.\nCorrected version:"
-            for p, s in zip(prefixes, students)
-        ]
         self.model.eval()
-        self.tok.padding_side = "left"
-        chat_payloads = self.tok.apply_chat_template(
-            [[
-                {"role": "system", "content": "You are a teacher."},
-                {"role": "user", "content": p}
-            ] for p in prompts],
-            tokenize=False,
-            add_generation_prompt=True,
-            # padding_side="left"
-        )
-        
+        if is_causal_lm(self.model.config._name_or_path):
+            prompts = [
+            f"first half:{p} second half:{s}. If this sentence is incorrect, provide a corrected " 
+            "version of the second half such that the sentence requires the minimal number of edits. You must preserves the first half exactly. "
+            "Provide one sentence only.\nCorrected version:"
+                for p, s in zip(prefixes, students)
+            ]
+            chat_payloads = self.tok.apply_chat_template(
+                [[
+                    {"role": "system", "content": "You are a teacher."},
+                    {"role": "user", "content": p}
+                ] for p in prompts],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            tok_chat_payload = self.tok(chat_payloads, return_tensors="pt", padding=True, truncation=True)
+            input_ids = tok_chat_payload.input_ids.to(DEVICE)
+            attention_mask = tok_chat_payload.attention_mask.to(DEVICE)
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=20,
+                    eos_token_id=self.tok.eos_token_id,
+                    pad_token_id=self.tok.pad_token_id,
+                    do_sample=True,
+                    # temperature=0.7,
+                    # top_p=0.9,
+                    # repetition_penalty=1.1,
+                    early_stopping=True,
+                )
+            generated_ids = [
+                output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids
+            , generated_ids)
+            ]
+        elif is_seq2seq(self.model.config._name_or_path):
+            prompts = self._build_prompts(prefixes, students)
+            tok_payload = self.tok(prompts, return_tensors="pt", padding=True)
+            # prefixes_ids = self.tok(prefixes, return_tensors="pt", padding=False).input_ids
+            input_ids = tok_payload.input_ids.to(DEVICE)
+            # attention_mask = torch.cat([p.attention_mask for p in tok_payload]).to(DEVICE)
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=20,
+                    eos_token_id=self.tok.eos_token_id,
+                    pad_token_id=self.tok.pad_token_id,
+                    do_sample=True,
+                    # temperature=0.7,
+                    # top_p=0.9,
+                    # repetition_penalty=1.1,
+                    # early_stopping=True,
+                )
+            generated_ids = [
+                output_ids[len(self.tok(prefixes_)):] for prefixes_, output_ids in zip(prefixes, generated_ids)
+            ]
+        else:
+            raise ValueError("Model type not supported for correction.")
+
         # Bucketed padding
         # target_len = pad_to_bucket(chat_payloads, self.tok, buckets=[64, 128, 256])
-        tok_chat_payload = self.tok(chat_payloads, return_tensors="pt", padding=True, truncation=True)
         # dyn = {k: v.to('cuda') for k, v in tok_chat_payload.items()}
         # tok_chat_payload.to('cuda')
         # Move to device once
-        input_ids = tok_chat_payload.input_ids.to(DEVICE)
-        attention_mask = tok_chat_payload.attention_mask.to(DEVICE)
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-            generated_ids = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=20,
-            eos_token_id=self.tok.eos_token_id,
-            pad_token_id=self.tok.pad_token_id,
-            do_sample=True,
-            # temperature=0.7,
-            # top_p=0.9,
-            # repetition_penalty=1.1,
-            # early_stopping=True,
-        )
         
-        generated_ids = [
-            output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids
-        , generated_ids)
-        ]
+       
 
         responses = self.tok.batch_decode(generated_ids, skip_special_tokens=True)
         results = []
@@ -219,7 +276,7 @@ class Caregiver:
         results = self.correct_batch([prefix], [student])
         return results[0]
 
-@torch.no_grad()
+# @torch.no_grad()
 def eval_blimp_hf(model, tok, n_per_cat=50, max_len=64, categories=None, progress=True):
     """Evaluate on BLiMP using shared helpers from blimp.py.
 
@@ -262,8 +319,8 @@ def batchify(items, bs):
         if not b: break
         yield b
 
-@torch.no_grad()
-def generate(model, tok, prefixes, max_new_tokens=12, temperature=1.0, top_p=0.9):
+# @torch.no_grad()
+def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=None, fast_sample=False):
     """Generate continuations for prefixes using the model (inference only)."""
     model.eval()
     
@@ -289,19 +346,32 @@ def generate(model, tok, prefixes, max_new_tokens=12, temperature=1.0, top_p=0.9
     #     print(f"[DEBUG] Decoded prefix: {tok.decode(non_pad_ids, skip_special_tokens=True)[:50]}")
     
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        out = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=3,
-            pad_token_id=tok.eos_token_id,
-            eos_token_id=tok.eos_token_id,
-            use_cache=True,
-        )
+        if not fast_sample:
+            out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                pad_token_id=tok.eos_token_id,
+                eos_token_id=tok.eos_token_id,
+                use_cache=True,
+            )
+        else:
+            out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                 # FASTEST SETTINGS:
+                do_sample=False,              # Greedy decoding (fastest)
+                num_beams=1,                  # No beam search
+                use_cache=True,               # KV-cache (essential!)
+                pad_token_id=tok.eos_token_id,
+                eos_token_id=tok.eos_token_id,
+            )
 
     # Extract only the generated tokens (not the input)
     out = [
@@ -330,10 +400,33 @@ def ce_targets(student, tok, x_list, y_list):
     return out.loss
 
 # logprob_sum: remove incorrect divide by len(tok) and use autocast
-@torch.no_grad()
-def logprob_sum(model, tok, x_list, y_list, max_len=1024):
+# @torch.no_grad()
+def logprob_sum(model, tok, x_list, y_list, max_len=256):
     """Compute sum of log probabilities for y given x (inference only)."""
     model.eval()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
+        
+        # Move to device and ensure Long dtype in one step
+        input_ids = torch.cat([enc_x.input_ids, enc_y.input_ids], dim=1).long().to(DEVICE)
+        attn_mask = torch.cat([enc_x.attention_mask, enc_y.attention_mask], dim=1).long().to(DEVICE)
+        
+        labels = input_ids.clone()
+        labels[:, :enc_x.input_ids.shape[1]] = -100
+        
+        out = model(input_ids=input_ids[:, :max_len], attention_mask=attn_mask[:, :max_len])
+        logits = out.logits[:, :-1]
+        tgt = labels[:, 1:]
+        mask_y = (tgt != -100)
+        logp_all = F.log_softmax(logits, dim=-1)
+        tgt_safe = tgt.masked_fill(~mask_y, 0)
+        token_lp = logp_all.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
+        return (token_lp * mask_y).sum(dim=1)
+    
+def logprob_sum_with_grad(model, tok, x_list, y_list, max_len=256):
+    """Compute sum of log probabilities for y given x (inference only)."""
+
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
         enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
@@ -378,7 +471,7 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     st_out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
     
     # Reference forward WITHOUT gradients
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         rf_out = reference(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
     
     # Shift for next-token prediction
@@ -396,7 +489,7 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     denom = mask_y.float().sum().clamp_min(1.0)
     return kl_tok.sum() / denom
 
-@torch.no_grad()
+# @torch.no_grad()
 def simple_logprob(model, tok, full_text):
     """Calculate logprob of full text sequence (simpler than logprob_sum)."""
     model.eval()
@@ -515,7 +608,7 @@ def combined_loss(student, reference, tok, prefixes, y_star, kl_weight=0.03):
     L_sft = st_out.loss
     
     # Reference forward (no grad) - reuse same inputs
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         ref_out = reference(input_ids=input_ids[:, :MAX_CONCAT], 
                            attention_mask=attn_mask[:, :MAX_CONCAT])
     
@@ -563,21 +656,23 @@ def _jaccard(a: str, b: str) -> float:
     if not sa and not sb: return 1.0
     return len(sa & sb) / max(len(sa | sb), 1)
 
-@torch.no_grad()
+# @torch.no_grad()
 def build_contrastive_pairs(
     student, reference, tok, prefixes: List[str], attempts: List[str],
-    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 15,
+    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 20,
     critic = None  # optional LLM critic scores
 ) -> Tuple[List[str], List[str], List[str]]:
     xs, chosen, rejected = [], [], []
+    student.eval()
+    reference.eval()
     for x, a0 in zip(prefixes, attempts):
         # pool candidates
         pool = set()
         pool.add((a0 or "").strip())
         gens = []
-        # gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.1, top_p=1.0)  # greedy
-        gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.7, top_p=0.9)
-        # gens += generate(student, tok, [x], max_new_tokens=max_len, temperature=0.9, top_p=0.95)
+        # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.1, fast_sample=True)  # greedy
+        gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
+        # gens += complete(student, tok, [x], max_new_tokens=max_len, fast_sample=True)
         for g in gens:
             if g is not None:
                 pool.add(g.strip())
@@ -588,28 +683,29 @@ def build_contrastive_pairs(
         if not cand_list:
             continue
 
-        # reference-based score (fast, consistent with DPO objective)
+        # critic-based score
         ref_scored = []
         for y in cand_list:
-            s = _norm_logprob_per_tok(reference, tok, x, y)
-            s -= 0.8 * _rep_frac(y, n=3)
-            s -= 0.8 * _prefix_leak(x, y)
-            if len(y.split()) > max_len: s -= 0.5
-            if not y: s -= 1.0
+            s = _norm_logprob_per_tok(critic, tok, x, y)
+            # s -= 0.8 * _rep_frac(y, n=3)
+            # s -= 0.8 * _prefix_leak(x, y)
+            # if len(y.split()) > max_len: s -= 0.5
+            # if not y: s -= 1.0
             ref_scored.append((s, y))
 
         # optional: LLM critic reranking (e.g., caregiver-7B) for stronger contrast
         # critic(x, cands) -> list of floats (higher is better), same order as cand_list
-        critic_weight = 0.5
-        if critic is not None and len(cand_list) > 1:
-            try:
-                with torch.no_grad():
-                    crit_scores = critic(x, cand_list)  # length == len(cand_list)
-                # blend: keep reference as anchor; critic as reranker
-                crit_map = {y: cs for y, cs in zip(cand_list, crit_scores)}
-                ref_scored = [ (s + critic_weight * crit_map.get(y, 0.0), y) for (s, y) in ref_scored ]
-            except Exception:
-                pass  # fall back to reference-only
+        # critic_weight = 0.5
+        # # critic = None  # disable for now
+        # if critic is not None and len(cand_list) > 1:
+        #     try:
+        #         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+        #             crit_scores = critic(x, cand_list)  # length == len(cand_list)
+        #         # blend: keep reference as anchor; critic as reranker
+        #         crit_map = {y: cs for y, cs in zip(cand_list, crit_scores)}
+        #         ref_scored = [ (s + critic_weight * crit_map.get(y, 0.0), y) for (s, y) in ref_scored ]
+        #     except Exception:
+        #         pass  # fall back to reference-only
 
         ref_scored.sort(key=lambda t: t[0])
         s_lo, y_lo = ref_scored[0]
@@ -622,6 +718,6 @@ def build_contrastive_pairs(
             continue
         if y_hi == y_lo: 
             continue
-
+        student.train()
         xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
     return xs, chosen, rejected

@@ -1,34 +1,3 @@
-# bnc_interactive_train.py
-# ==================================================================================
-# PERFORMANCE OPTIMIZATIONS APPLIED:
-# ==================================================================================
-# Inference Optimizations:
-#   - torch.compile with max-autotune for all inference-only models (reference, critic, caregiver)
-#   - torch.inference_mode() for generation and uncertainty calculation (faster than no_grad)
-#   - Mixed precision (bfloat16) for all forward passes
-#   - Flash Attention 2 support (if available)
-#   - KV-cache enabled (use_cache=True) for autoregressive generation
-#   
-# Training Optimizations:
-#   - Fused AdamW optimizer (faster parameter updates on CUDA)
-#   - Gradient checkpointing (memory efficiency)
-#   - TF32 matmul enabled for faster computation on Ampere+ GPUs
-#   - cudnn.benchmark for optimal kernel selection
-#   - Gradient zeroing with set_to_none=True (memory efficiency)
-#   - High precision matmul (float32_matmul_precision="high")
-#
-# Data Pipeline Optimizations:
-#   - Fast tokenizer (use_fast=True)
-#   - Left padding for efficient batch generation
-#   - Parallel data loading (num_workers=4, pin_memory=True)
-#   - Batch processing for caregiver corrections
-#
-# Compiler Configuration:
-#   - Dynamic shapes disabled for stable inference graphs
-#   - Cache size limit increased to 64 (default 8) for text generation workloads
-#   - CUDA graphs disabled to avoid dynamic shape warnings
-#   - Suppress recompilation warnings
-# ==================================================================================
 import os, re, math, random, json, argparse, itertools, time
 import pickle  # Add this import
 from dataclasses import dataclass
@@ -53,9 +22,23 @@ from color_logger import get_logger, MLColors, Fore, Style
 # BLiMP evaluation utilities
 from blimp import run_subset, ensure_subsets_list, pick_split
 
-from interactive_utils import Caregiver, CaregiverOutput, build_contrastive_pairs, dpo_loss, eval_blimp_hf, get_uncertainty, generate, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
+from interactive_utils import Caregiver, CaregiverOutput, build_contrastive_pairs, dpo_loss, eval_blimp_hf, get_uncertainty, complete, ce_targets, kl_to_ref, logprob_sum, mini_morph, WordBudget, combined_loss
 
 from prepare_data import load_or_prepare_dataset
+
+import torch._dynamo as dynamo
+import torch._inductor.config as inductor_config
+
+# Initialize the color logger
+logger = get_logger("BabyLM-Interactive")
+
+# Enable parallel compilation (use all CPU cores)
+inductor_config.compile_threads = 16
+logger.info(f"Enabled parallel torch.compile with {inductor_config.compile_threads} threads")
+
+# Enable persistent cache to avoid recompiling across runs
+inductor_config.fx_graph_cache = True
+dynamo.config.cache_size_limit = 256
 
 # Disable torch compile for debugging (single line toggle)
 torch._dynamo.config.disable = True
@@ -65,7 +48,7 @@ random.seed(7)
 torch.manual_seed(7)
 
 # Disable torch.compile for debugging (single line toggle)
-torch._dynamo.config.disable = True 
+# torch._dynamo.config.disable = False
 
 # Add after imports & seeds (near top, after DEVICE):
 torch.set_float32_matmul_precision("high")
@@ -74,8 +57,6 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-# Initialize the color logger
-logger = get_logger("BabyLM-Interactive")
 
 # # Make compile robust to dynamic shapes and fall back instead of crashing
 try:
@@ -104,11 +85,14 @@ except Exception as e:
 
 from datasets import load_dataset, get_dataset_config_names
 
-def build_model(checkpoint_path):
+def build_model(checkpoint_path, tokenizer):
 
     config_path = os.path.join(checkpoint_path, "config.json")
     model_config = AutoConfig.from_pretrained(config_path)
     model = AutoModelForCausalLM.from_config(model_config)
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
 
     return model
 
@@ -123,9 +107,9 @@ def main():
     ap.add_argument("--model_path", type=str, default=None, help="Optional path to a LoRA adapter directory (with adapter_config.json) to load and merge into base using load_lora.py. If provided, overrides --model_name.")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--use_dpo", action="store_true")
-    ap.add_argument("--eval_every", type=int, default=1000)
+    ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--save_dir", type=str, default="./ckpts_bnc_interactive")
     ap.add_argument("--config_path", type=str, required=True, help="Path to the configuration file")
     args = ap.parse_args()
@@ -156,9 +140,20 @@ def main():
     
     if args.model_path:
         logger.info(f"Loading base + LoRA (adapters trainable only) from: {Fore.CYAN}{args.model_path}{Style.RESET_ALL}")
+        # Tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        tokenizer.model_max_length = model_config.get("n_ctx")
+        print(f"Tokenizer model_max_length set to {getattr(tokenizer, 'model_max_length', 'N/A')}")
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        # Decoder models need left padding
+        tokenizer.padding_side = 'left'
+        logger.info(f"Set tokenizer padding_side to: {Fore.GREEN}left{Style.RESET_ALL} (required for decoder-only models)")
+
         # Discover base model from adapter config, else fall back to --model_name
         try:
-            student = build_model(checkpoint_path)
+            student = build_model(checkpoint_path, tokenizer)
             weights_path = os.path.join(args.model_path, "pytorch_model.bin")
             if os.path.isfile(weights_path):
                 state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
@@ -170,15 +165,7 @@ def main():
         except Exception as ee:
             logger.error(f"Model-only weight restore failed: {ee}")
 
-        # Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-        tokenizer.model_max_length = model_config.get("n_ctx")
-        print(f"Tokenizer model_max_length set to {getattr(tokenizer, 'model_max_length', 'N/A')}")
         
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        # Decoder models need left padding
-        tokenizer.padding_side = 'left'
         student.train()
         student.to(DEVICE)
         logger.info("Loaded student model")
@@ -247,7 +234,7 @@ def main():
         logger.warning(f"torch.compile (reference) skipped: {e}")
 
     logger.info("Setting up caregiver...")
-    caregiver = Caregiver()
+    caregiver = Caregiver(model_name='grammarly/coedit-large')
     
     # Compile caregiver model for faster inference (wrap, don't reassign)
     original_model = caregiver.model
@@ -308,7 +295,7 @@ def main():
         return all_sentences
     # Reduce workers to avoid tokenizer parallelism issues with streaming datasets
     # Add drop_last=True to stabilize batch shape for compiled graphs
-    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=4, pin_memory=True, drop_last=True, shuffle=True, collate_fn=sentence_batch_collate_fn)
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=6, pin_memory=True, drop_last=True, shuffle=True, collate_fn=sentence_batch_collate_fn)
 
     # Optim & sched
     logger.info("Setting up optimizer and scheduler...")
@@ -356,7 +343,7 @@ def main():
     
     # Caregiver audit: log corrections every 25 steps
     audit_path = os.path.join(args.save_dir, "caregiver_audit.json")
-    critic_name = 'grammarly/coedit-large'
+    critic_name = 'Qwen/Qwen2.5-7B-Instruct'
     # Load critic (prefer causal LM; fallback to seq2seq if needed)
     try:
         critic = AutoModelForCausalLM.from_pretrained(
@@ -382,9 +369,9 @@ def main():
     except Exception as e:
         logger.warning(f"torch.compile (critic) skipped: {e}")
 
-    dpo_interval = 5
-    dpo_warmup = 250  # steps
-    last_L_dpo = torch.tensor(0.0, device=DEVICE)  # for smoother logging
+    # dpo_interval = 1
+    # dpo_warmup = 250  # steps
+    # last_L_dpo = torch.tensor(0.0, device=DEVICE)  # for smoother logging
 
     for batch in loader:
         step_start = time.time()
@@ -397,11 +384,10 @@ def main():
 
         # Generate short student attempts
         gen_start = time.time()
-        with torch.inference_mode():  # Faster than no_grad for pure inference
-            attempts = generate(student, tokenizer, prefixes, temperature=0.9, top_p=0.9)
+        attempts = complete(student, tokenizer, prefixes, max_new_tokens=15, temperature=0.9)
         
         # Ensure strings for downstream typing (guard lints)
-        # attempts = [a if isinstance(a, str) else "" for a in attempts]
+        attempts = [a if isinstance(a, str) else "" for a in attempts]
         gen_time = time.time() - gen_start
         step_times["generate"] += gen_time
         
@@ -421,110 +407,60 @@ def main():
             idxs_to_correct = [i for i, flag in enumerate(needs_correction) if flag]
             prefixes_subset = [prefixes[i] for i in idxs_to_correct]
             attempts_subset = [attempts[i] if isinstance(attempts[i], str) else "" for i in idxs_to_correct]
-           
-            # Invoke caregiver only on subset
-            try:
-                outs_subset = caregiver.correct_batch(prefixes_subset, attempts_subset)
+    
+            correct_time = time.time() - correct_start
+            step_times["correct"] += correct_time
+            # # Track correction statistics for logging
+            # if step % 200 == 0:  # Less frequent than main logging
+            #     tag_counts = {}
+            #     for o in outs:
+            #         tag_counts[o.tag] = tag_counts.get(o.tag, 0) + 1
                 
-                # Audit caregiver corrections every 25 steps
-                if step % 25 == 0:
-                    audit_records = []
-                    for idx, o_sub in zip(idxs_to_correct, outs_subset):
-                        # lines = o_sub.corrected.split('\n')
-                        # flatten lines into single string with | separator
-                        # lines = re.split(r'[\n|]+', o_sub.corrected)
-                        # text = " | ".join([line.strip() for line in o_sub if line.strip()])
-                        audit_records.append({
-                            "step": int(step),
-                            "prefix": str(prefixes[idx]),
-                            "student": str(attempts[idx]),
-                            "caregiver_corrected": o_sub.corrected,
-                        })
+            #     if any(tag != "other" for tag in tag_counts):
+            #         corrections_msg = []
+            #         for tag, count in sorted(tag_counts.items()):
+            #             if tag != "other" and count > 0:
+            #                 color = Fore.GREEN if tag in ["agreement", "reflexive"] else Fore.CYAN
+            #                 corrections_msg.append(f"{color}{tag}: {count}{Style.RESET_ALL}")
                     
-                    # Append to audit file
-                    with open(audit_path, "a", encoding="utf-8") as f:
-                        for rec in audit_records:
-                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                
-                # Merge back: corrected samples + unchanged samples
-                outs = []
-                correct_iter = iter(outs_subset)
-                for i, flag in enumerate(needs_correction):
-                    if flag:
-                        outs.append(next(correct_iter))
-                    else:
-                        # Keep student's original output
-                        outs.append(CaregiverOutput(attempts[i]))
-            except Exception as e:
-                logger.warning(f"⚠️  Caregiver batch failed: {e}")
-                outs = [CaregiverOutput(str(att or "")) for att in attempts]
-        else:
-            # No samples need correction
-            outs = [CaregiverOutput(str(att or "")) for att in attempts]
-        
-        y_star = [o.corrected for o in outs]
-        # y_star = text
-        correct_time = time.time() - correct_start
-        step_times["correct"] += correct_time
+            #         if corrections_msg:
+            #             logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
 
-        # # Track correction statistics for logging
-        # if step % 200 == 0:  # Less frequent than main logging
-        #     tag_counts = {}
-        #     for o in outs:
-        #         tag_counts[o.tag] = tag_counts.get(o.tag, 0) + 1
-            
-        #     if any(tag != "other" for tag in tag_counts):
-        #         corrections_msg = []
-        #         for tag, count in sorted(tag_counts.items()):
-        #             if tag != "other" and count > 0:
-        #                 color = Fore.GREEN if tag in ["agreement", "reflexive"] else Fore.CYAN
-        #                 corrections_msg.append(f"{color}{tag}: {count}{Style.RESET_ALL}")
-                
-        #         if corrections_msg:
-        #             logger.debug(f"📝 Corrections in batch: {', '.join(corrections_msg)}")
+            # --- Compute core losses first ---
+            forward_start = time.time()
+            L_kl  = kl_to_ref(student, reference, tokenizer, prefixes, attempts)  # ✅ Use attempts, not y_star
+            L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
+            # do_dpo = args.use_dpo and (step % dpo_interval == 0)
 
-        # --- Compute core losses first ---
-        forward_start = time.time()
-        L_sft = ce_targets(student, tokenizer, prefixes, y_star)
-        L_kl  = kl_to_ref(student, reference, tokenizer, prefixes, attempts)  # ✅ Use attempts, not y_star
-        L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
-        # do_dpo = args.use_dpo and (step % dpo_interval == 0)
-        do_dpo = True
-
-        if do_dpo:
             xs, chosen, rejected = build_contrastive_pairs(
                 student, reference, tokenizer, prefixes_subset, attempts_subset,
-                k_per_prefix=6, margin=0.4, max_len=15, critic=critic
+                k_per_prefix=3, margin=0.6, max_len=12, critic=critic
             )
             if xs and chosen and rejected:
-                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.5)
-                last_L_dpo = L_dpo.detach()
-        else:
-            # Use last computed DPO loss for smoother loss
-            L_dpo = last_L_dpo.detach()
+                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.1)
+                # last_L_dpo = L_dpo.detach()
 
-        # Amortize and ramp DPO weight to avoid spikes
-        base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
-        ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
-        dpo_weight = base_dpo_weight * ramp
+            # Amortize and ramp DPO weight to avoid spikes
+            # base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
+            # ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
+            # dpo_weight = base_dpo_weight * ramp
 
-        # --- Combine losses (final total) ---
-        loss = L_sft + 0.75 * L_kl + dpo_weight * L_dpo
-        step_times["forward"] += time.time() - forward_start
+            # --- Combine losses (final total) ---
+            # assert L_dpo.requires_grad, "DPO loss is detached; remove no_grad/inference_mode on student terms"
+            loss = L_dpo
+            step_times["forward"] += time.time() - forward_start
 
-        # Update running average (EMA)
-        loss_val = float(loss.item())
-        avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
+            # Update running average (EMA)
+            loss_val = float(loss.item())
+            avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
 
-        backward_start = time.time()
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        opt.step(); sched.step()
-        step_times["backward"] += time.time() - backward_start
+            backward_start = time.time()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            opt.step(); sched.step()
+            step_times["backward"] += time.time() - backward_start
 
-        # Budget: only count texts we train ON (y*)
-        budget.add(y_star)
         if not budget.ok():
             logger.warning("⚠️  Reached 100M word limit. Stopping training.")
             break
@@ -536,10 +472,8 @@ def main():
         # Show running average first; remove Corr from the bar
         progress_metrics = {
             "Avg": f"{avg_loss:.3f}",
-            "Loss": f"{loss_val:.3f}",
-            "SFT": f"{L_sft.item():.3f}",
             "KL": f"{L_kl.item():.3f}",
-            "DPO": f"{(dpo_weight * (L_dpo if do_dpo else last_L_dpo)).item():.3f}",
+            "DPO": f"{L_dpo.item():.3f}",
             "LR": f"{current_lr:.1e}",
             "Words": f"{budget.used/1e6:.1f}M",
         }
@@ -548,9 +482,9 @@ def main():
         # Detailed logging every 100 steps (less frequent than progress bar)
         if step % 100 == 0:
             # Use the enhanced loss display from the logger
-            losses = {"Total": loss.item(), "SFT": L_sft.item(), "KL": L_kl.item(), "DPO": L_dpo.item()}
-            thresholds = {"Total": (2.5, 4.0), "SFT": (2.0, 3.0), "KL": (0.1, 0.5), "DPO": (1.0, 2.0)}
-            
+            losses = {"Total": loss.item(), "KL": L_kl.item(), "DPO": L_dpo.item()}
+            thresholds = {"Total": (2.5, 4.0), "KL": (0.1, 0.5), "DPO": (1.0, 2.0)}
+
             loss_display = logger.loss_display(losses, thresholds)
             
             # Calculate correction rate for display
@@ -586,7 +520,6 @@ def main():
             
             # Update progress bar with evaluation metrics
             eval_metrics = {
-                "SFT_loss": L_sft.item(),
                 "KL_loss": L_kl.item(), 
                 "DPO_loss": L_dpo.item(),
                 "BLiMP_score": bl,
