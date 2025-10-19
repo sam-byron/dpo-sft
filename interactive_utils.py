@@ -320,31 +320,14 @@ def batchify(items, bs):
         yield b
 
 # @torch.no_grad()
-def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=None, fast_sample=False):
-    """Generate continuations for prefixes using the model (inference only)."""
+def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=None, fast_sample=False,
+             num_beams: int = 1, num_return_sequences: int = 1):
+    """Generate continuations; supports multiple return sequences per prefix."""
     model.eval()
-    
-    # Use standard padding (left-side) without bucket optimization for now
-    # The bucket optimization was causing attention mask issues
-    enc = tok(
-        prefixes, 
-        return_tensors="pt", 
-        padding=True,  # Use dynamic padding instead of max_length
-        truncation=True,
-        max_length=512
-    ).to(DEVICE)
-    
+    enc = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=512).to(DEVICE)
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
-    
-    # Debugging: verify padding is correct (1% sample rate)
-    # if torch.rand(1).item() < 0.01:
-    #     print(f"[DEBUG] First input_ids: {input_ids[0][:20].tolist()}")
-    #     print(f"[DEBUG] First attn_mask: {attention_mask[0][:20].tolist()}")
-    #     # Decode only non-padding tokens
-    #     non_pad_ids = input_ids[0][attention_mask[0].bool()]
-    #     print(f"[DEBUG] Decoded prefix: {tok.decode(non_pad_ids, skip_special_tokens=True)[:50]}")
-    
+
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         if not fast_sample:
             out = model.generate(
@@ -359,25 +342,36 @@ def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=Non
                 pad_token_id=tok.eos_token_id,
                 eos_token_id=tok.eos_token_id,
                 use_cache=True,
+                num_return_sequences=num_return_sequences,  # <-- ensure R matches
             )
         else:
             out = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
-                 # FASTEST SETTINGS:
-                do_sample=False,              # Greedy decoding (fastest)
-                num_beams=1,                  # No beam search
-                use_cache=True,               # KV-cache (essential!)
+                do_sample=False,          # greedy/beam
+                num_beams=num_beams,
+                num_return_sequences=num_return_sequences,
+                length_penalty=1.0,
+                early_stopping=True,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                use_cache=True,
                 pad_token_id=tok.eos_token_id,
                 eos_token_id=tok.eos_token_id,
             )
 
-    # Extract only the generated tokens (not the input)
-    out = [
-        output_ids[len(input_ids_):] for input_ids_, output_ids in zip(input_ids, out)
-    ]
-    return [tok.decode(g, skip_special_tokens=True).strip() for g in out]
+    # Keep all sequences: B prefixes × R returns
+    B = input_ids.size(0)
+    R = int(num_return_sequences)
+    prompt_len = input_ids.size(1)  # <-- slice by full padded prompt length
+    results = []
+    for i in range(B):
+        for r in range(R):
+            seq_ids = out[i*R + r]
+            gen_ids = seq_ids[prompt_len:]  # <-- fixes prefix echo with left/right padding
+            results.append(tok.decode(gen_ids, skip_special_tokens=True).strip())
+    return results
 
 def ce_targets(student, tok, x_list, y_list):
     """Cross-entropy loss on target y given prefix x (requires gradients)."""
@@ -675,9 +669,13 @@ def build_contrastive_pairs(
         for x, a0 in zip(prefixes, attempts):
             # pool candidates
             pool = set()
-            pool.add((a0 or "").strip())
+            # pool.add((a0 or "").strip())
             gens = []
-            gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
+            # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
+            gens += complete(student, 
+                             tok, [x], 
+                             max_new_tokens=max_len, fast_sample=False, 
+                             num_beams=8, num_return_sequences=8, temperature=0.4, top_p=0.8)
             for g in gens:
                 if g is not None:
                     pool.add(g.strip())
@@ -694,23 +692,23 @@ def build_contrastive_pairs(
                 s = _norm_logprob_per_tok(critic, tok, x, y)
                 ref_scored.append((s, y))
 
-            ref_scored.sort(key=lambda t: t[0])
+            ref_scored.sort(key=lambda t: t[0], reverse=True)
             
             # Write audit record - one candidate per line
             if audit_file:
-                # Write prefix header
-                audit_file.write(f"PREFIX: {x}\n")
-                
-                # Write each candidate on its own line
-                for i, (s, y) in enumerate(ref_scored):
-                    audit_file.write(f"  RANK {i+1} | SCORE {s:.4f} | TEXT: {y}\n")
-                
-                # Add separator between prefix groups
-                audit_file.write("\n")
-                audit_file.flush()  # Ensure written immediately
-            
-            s_lo, y_lo = ref_scored[0]
-            s_hi, y_hi = ref_scored[-1]
+                audit_record = {
+                    "prefix": x,
+                    "ranked_candidates": [
+                        {"rank": i+1, "score": float(s), "text": y} 
+                        for i, (s, y) in enumerate(ref_scored)
+                    ]
+                }
+                # Pretty-print JSON with indentation
+                audit_file.write(json.dumps(audit_record, ensure_ascii=False, indent=2) + "\n\n")
+                audit_file.flush()
+
+            s_lo, y_lo = ref_scored[-1]
+            s_hi, y_hi = ref_scored[0]
 
             # filter weak/near-duplicate pairs
             if (s_hi - s_lo) < margin: 
@@ -725,5 +723,6 @@ def build_contrastive_pairs(
     finally:
         if audit_file:
             audit_file.close()
+        student.train()
     
     return xs, chosen, rejected

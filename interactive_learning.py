@@ -343,7 +343,14 @@ def main():
     
     # Caregiver audit: log corrections every 25 steps
     audit_path = os.path.join(args.save_dir, "caregiver_audit.json")
+    # if audit_file is not None then delete existing audit file
+    if os.path.isfile(audit_path):
+        os.remove(audit_path)
+        logger.info(f"Removed existing caregiver audit file at: {audit_path}")
+
     critic_name = 'Qwen/Qwen2.5-7B-Instruct'
+    # critic_name = 'grammarly/coedit-xl'
+    # critic_name = 'microsoft/phi-4'
     # Load critic (prefer causal LM; fallback to seq2seq if needed)
     try:
         critic = AutoModelForCausalLM.from_pretrained(
@@ -434,7 +441,7 @@ def main():
 
             xs, chosen, rejected = build_contrastive_pairs(
                 student, reference, tokenizer, prefixes_subset, attempts_subset,
-                k_per_prefix=3, margin=0.6, max_len=12, critic=critic, audit_path=audit_path
+                k_per_prefix=6, margin=0.3, max_len=12, critic=critic, audit_path=audit_path
             )
             if xs and chosen and rejected:
                 L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.1)
