@@ -21,12 +21,174 @@ from transformers import AutoTokenizer
 # from torch.utils.data import DataLoader
 from torch.utils.data import DataLoader, Dataset
 from transformers import BertTokenizer, BertModel
-
+from typing import Optional
 from transformers.tokenization_utils_base import BatchEncoding
 
 from sentence_packing import pack_sentences
 
 SPEAKER_PATTERN = re.compile(r"^([A-Z][a-zA-Z]{1,20})(:| —|-)")
+
+_HARD_SPLIT = re.compile(r"[;,—–]|(?:\s-\s)")  # comma handled manually to keep tighter control
+_AUX = re.compile(r"\b(is|are|was|were|has|have|had|do|does|did|will|would|can|could|should|may|might)\b", re.I)
+_REL = re.compile(r"\b(who|that|which)\b", re.I)
+_EITHER = re.compile(r"\beither\b", re.I)
+_NEITHER = re.compile(r"\bneither\b", re.I)
+_OR_NOR = re.compile(r"\b(or|nor)\b", re.I)
+_DANGLERS = {"of","to","in","at","on","for","with","and","or","that","which","who","a","an","the"}
+
+def _token_slices(tok, text: str) -> list[int]:
+    """Return character offsets that roughly align with spaces between words."""
+    # Fast and robust: rely on Python split points rather than BPE boundaries for the cut
+    offs = [0]
+    cur = 0
+    for m in re.finditer(r"\s+", text):
+        offs.append(m.start())
+    offs.append(len(text))
+    return offs
+
+def choose_prefix(s: str, tok, model=None, target_tokens=20, min_tokens=8, max_tokens=32) -> Optional[str]:
+    s = s.strip()
+    if not s:
+        return None
+
+    # 0) Precompute word-ish split offsets and tokenized length function
+    offs = _token_slices(tok, s)
+    def toklen(t): return len(tok(t, add_special_tokens=False)["input_ids"])
+
+import re
+from typing import Optional
+
+def choose_prefix(s: str, target_words: int = 20, min_words: int = 8, max_words: int = 32) -> Optional[str]:
+    """
+    Heuristic, tokenizer-free prefix chooser.
+    1) Prefer hard boundaries (comma/semicolon/em-dash) near target length.
+    2) Else cut at light grammar cues (either/neither…or/nor; relative pronouns; before first aux/modal after min_words).
+    3) Else snap to nearest whitespace around target word count.
+    Cleanup: avoid dangling function words; enforce [min_words, max_words].
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+
+    # Word spans by character offsets
+    word_spans = [m.span() for m in re.finditer(r"\S+", s)]
+    n_words = len(word_spans)
+    if n_words == 0:
+        return None
+
+    DANGLERS = {"of","to","in","at","on","for","with","and","or","that","which","who","a","an","the"}
+    HARD = re.compile(r"[,;]|—|–|\s-\s")  # comma handled via segments
+    EITHER = re.compile(r"\beither\b", re.I)
+    NEITHER = re.compile(r"\bneither\b", re.I)
+    ORNOR  = re.compile(r"\b(or|nor)\b", re.I)
+    REL    = re.compile(r"\b(who|that|which)\b", re.I)
+    AUX    = re.compile(r"\b(is|are|was|were|has|have|had|do|does|did|will|would|can|could|should|may|might)\b", re.I)
+
+    def end_char_for_word_idx(widx: int) -> int:
+        # widx is 1-based word count
+        widx = max(1, min(widx, n_words))
+        return word_spans[widx-1][1]
+
+    def cut_at_word_idx(widx: int) -> Optional[str]:
+        if widx < 1:
+            return None
+        end = end_char_for_word_idx(widx)
+        cand = s[:end].rstrip()
+        cand = re.sub(r"[\s,;:—–-]+$", "", cand)  # strip trailing punctuation
+        ws = cand.split()
+        if ws and ws[-1].lower() in DANGLERS and len(ws) >= 2:
+            cand = " ".join(ws[:-1])
+        w = len(cand.split())
+        if w < min_words:
+            return None
+        if w > max_words:
+            cand = s[:end_char_for_word_idx(max_words)].rstrip()
+        return cand
+
+    def nearest_to_target() -> Optional[str]:
+        if n_words < min_words:
+            return None
+        lo = min_words
+        hi = min(max_words, n_words)
+        best = min(range(lo, hi+1), key=lambda i: abs(i - target_words))
+        return cut_at_word_idx(best)
+
+    # Pass 1: hard punctuation near target
+    punct_positions = []
+    for i, m in enumerate(re.finditer(r"\S+\s*", s)):
+        seg = m.group(0)
+        if HARD.search(seg):
+            punct_positions.append(i+1)  # cut AFTER this word
+    if punct_positions:
+        cands = [i for i in punct_positions if i >= min_words]
+        if cands:
+            best = min(cands, key=lambda i: abs(i - target_words))
+            cand = cut_at_word_idx(best)
+            if cand:
+                return cand
+
+    # Pass 2: cue boundaries
+    # either/neither … or/nor: cut BEFORE the 'or/nor'
+    m_on = ORNOR.search(s)
+    if m_on:
+        # figure word index at start of 'or/nor'
+        start_char = m_on.start()
+        w_before = sum(1 for st, en in word_spans if en <= start_char)
+        cand = cut_at_word_idx(max(w_before, min_words))
+        if cand:
+            return cand
+
+    # relative pronoun: cut AT the relative pronoun
+    m_rel = REL.search(s)
+    if m_rel:
+        start_char = m_rel.start()
+        w_at = sum(1 for st, en in word_spans if en <= start_char) + 1
+        cand = cut_at_word_idx(max(w_at, min_words))
+        if cand:
+            return cand
+
+    # first aux/modal after min_words: cut BEFORE it (to invite completion)
+    words = [s[st:en] for st, en in word_spans]
+    for i, wtok in enumerate(words, start=1):
+        if i < min_words:
+            continue
+        if AUX.fullmatch(wtok) or AUX.search(wtok):
+            cand = cut_at_word_idx(i-1)
+            if cand:
+                return cand
+
+    # Pass 3: nearest whitespace around target
+    cand = nearest_to_target()
+    if cand:
+        return cand
+
+    # Fallback: truncate to max_words
+    return cut_at_word_idx(min(n_words, max_words))
+
+
+CUE_PATTERNS = [
+    r"\b(either)\b.*\b(or)\b",
+    r"\b(neither)\b.*\b(nor)\b",
+    r"\b(who|that|which)\b",
+    r"\bnot\b|\bnever\b|\bhardly\b|\bscarcely\b|\bwithout\b",
+    r"\b(any|ever)\b",
+    r"\bif\b.*\bwere\b",
+    r"\bdoes\b|\bdo\b|\bdid\b",
+    r",\s*(and|or)\s",
+]
+CUES = [re.compile(p, re.IGNORECASE) for p in CUE_PATTERNS]
+
+def has_cue(text: str) -> bool:
+    return any(p.search(text) for p in CUES)
+
+def sent_split(line: str):
+    for s in re.split(r"(?<=[\.!?])\s+", line):
+        s = s.strip()
+        if s and len(s) >= 10 and sum(ch.isalpha() for ch in s) >= 6:
+            yield s
+            
 
 def load_first_names(path:"str"):
     names=set()
@@ -84,6 +246,14 @@ class GPTDataset(Dataset):
                 except Exception as e:
                     print(f"Warning: Could not read {file_path}: {e}")
 
+    def _curate(self):
+        self.curated = []
+        for segment in self.segments:
+            for sent in sent_split(segment):
+                if has_cue(sent):
+                    self.curated.append(sent)
+        print(f"Curated dataset size: {len(self.curated)} segments with cues")  
+
     def __len__(self):
         return len(self.segments)
     
@@ -128,10 +298,15 @@ class GPTDataset(Dataset):
                 for sent in sent_parts:
                     sent = sent.strip()
                     word_count = len(sent.split())
-                    if word_count >= 10:  # Only add non-empty sentences
-                        take = min(word_count//3, 10)
-                        sentences.append(' '.join(sent.split()[:take]))
-
+                    if word_count >= 10 and word_count <= 20:  # Only add non-empty sentences
+                        if has_cue(sent):
+                            # take = min(word_count//3, 10)
+                            # sentences.append(' '.join(sent.split()[:take]))
+                            joined = ' '.join(sent.split())
+                            prefix = choose_prefix(joined)
+                            if prefix:
+                                sentences.append(prefix)
+            # check if sentences if empty
             return sentences
 
 def iter_raw_lines(data_dir):
