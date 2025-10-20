@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--model_path", type=str, default=None, help="Optional path to a LoRA adapter directory (with adapter_config.json) to load and merge into base using load_lora.py. If provided, overrides --model_name.")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=5e-7)
+    ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--use_dpo", action="store_true")
     ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--save_dir", type=str, default="./ckpts_bnc_interactive")
@@ -442,61 +442,71 @@ def main():
             # --- Compute core losses first ---
             forward_start = time.time()
             L_kl  = kl_to_ref(student, reference, tokenizer, prefixes, attempts)  # ✅ Use attempts, not y_star
-            L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
+            # L_dpo = torch.tensor(0.0, device=DEVICE)  # default (in case we skip or no pairs)
             # do_dpo = args.use_dpo and (step % dpo_interval == 0)
 
             xs, chosen, rejected = build_contrastive_pairs(
                 student, reference, tokenizer, prefixes_subset, attempts_subset,
-                k_per_prefix=4, margin=0.5, max_len=10, critic=critic, audit_path=audit_path
+                k_per_prefix=4, max_len=10, critic=critic, audit_path=audit_path
             )
             if xs and chosen and rejected:
-                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.05)
+                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.1)
                 # last_L_dpo = L_dpo.detach()
 
-            # Amortize and ramp DPO weight to avoid spikes
-            # base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
-            # ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
-            # dpo_weight = base_dpo_weight * ramp
-            torch.set_grad_enabled(True)
-            student.train()
-            # --- Combine losses (final total) ---
-            # assert L_dpo.requires_grad, "DPO loss is detached; remove no_grad/inference_mode on student terms"
-            loss = L_dpo
-            step_times["forward"] += time.time() - forward_start
+                # Amortize and ramp DPO weight to avoid spikes
+                # base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
+                # ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
+                # dpo_weight = base_dpo_weight * ramp
+                torch.set_grad_enabled(True)
+                student.train()
+                # --- Combine losses (final total) ---
+                # assert L_dpo.requires_grad, "DPO loss is detached; remove no_grad/inference_mode on student terms"
+                loss = L_dpo
+                step_times["forward"] += time.time() - forward_start
 
-            # Update running average (EMA)
-            loss_val = float(loss.item())
-            avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
+                # Update running average (EMA)
+                loss_val = float(loss.item())
+                avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
 
-            # Guards to catch future detaches
-            # assert torch.is_grad_enabled(), "Grad disabled at loss computation"
-            # assert loss.requires_grad and loss.grad_fn is not None, "Loss is detached; check for .item() or no_grad around loss"
+                # Guards to catch future detaches
+                # assert torch.is_grad_enabled(), "Grad disabled at loss computation"
+                # assert loss.requires_grad and loss.grad_fn is not None, "Loss is detached; check for .item() or no_grad around loss"
 
- 
-            backward_start = time.time()
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-            opt.step(); sched.step()
-            step_times["backward"] += time.time() - backward_start
+                # ...before loss.backward() in your loop
+                if step % 1 == 0:
+                    print(
+                        "requires_grad:",
+                        dict(
+                            loss=loss.requires_grad,
+                            # L_sft=L_sft.requires_grad,
+                            L_kl=L_kl.requires_grad,
+                            L_dpo=L_dpo.requires_grad,
+                        )
+                    )
+                backward_start = time.time()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                opt.step(); sched.step()
+                step_times["backward"] += time.time() - backward_start
 
-        if not budget.ok():
-            logger.warning("⚠️  Reached 100M word limit. Stopping training.")
-            break
+                if not budget.ok():
+                    logger.warning("⚠️  Reached 100M word limit. Stopping training.")
+                    break
 
-        # Update progress bar with current metrics (ensure all losses are shown)
-        current_lr = sched.get_last_lr()[0]
-        
-        # Use dictionary method for progress bar updates (order matters in tqdm)
-        # Show running average first; remove Corr from the bar
-        progress_metrics = {
-            "Avg": f"{avg_loss:.3f}",
-            "KL": f"{L_kl.item():.3f}",
-            "DPO": f"{L_dpo.item():.3f}",
-            "LR": f"{current_lr:.1e}",
-            "Words": f"{budget.used/1e6:.1f}M",
-        }
-        logger.update_progress(step, **progress_metrics)
+                # Update progress bar with current metrics (ensure all losses are shown)
+                current_lr = sched.get_last_lr()[0]
+                
+                # Use dictionary method for progress bar updates (order matters in tqdm)
+                # Show running average first; remove Corr from the bar
+                progress_metrics = {
+                    "Avg": f"{avg_loss:.3f}",
+                    "KL": f"{L_kl.item():.3f}",
+                    "DPO": f"{L_dpo.item():.3f}",
+                    "LR": f"{current_lr:.1e}",
+                    "Words": f"{budget.used/1e6:.1f}M",
+                }
+                logger.update_progress(step, **progress_metrics)
 
         # Detailed logging every 100 steps (less frequent than progress bar)
         if step % 100 == 0:

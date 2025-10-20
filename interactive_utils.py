@@ -89,7 +89,7 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
       beta: temperature (larger -> more aggressive)
     Returns: scalar loss
     """
-    student.train()
+    student.eval()
     reference.eval()
 
     # Student preferences (requires grad)
@@ -98,10 +98,10 @@ def dpo_loss(student, reference, tok, xs, y_pos, y_neg, beta=0.1, max_len=256):
     stu_delta = lp_pos_stu - lp_neg_stu
     
     # Reference preferences (detached, computed once)
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        lp_pos_ref = logprob_sum(reference, tok, xs, y_pos, max_len=max_len)  # [B]
-        lp_neg_ref = logprob_sum(reference, tok, xs, y_neg, max_len=max_len)  # [B]
-        ref_delta = (lp_pos_ref - lp_neg_ref).detach()  # Explicit detach for safety
+    # with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+    lp_pos_ref = logprob_sum_with_grad(reference, tok, xs, y_pos, max_len=max_len)  # [B]
+    lp_neg_ref = logprob_sum_with_grad(reference, tok, xs, y_neg, max_len=max_len)  # [B]
+    ref_delta = (lp_pos_ref - lp_neg_ref)
 
     # Score and logistic loss
     margin = beta * (stu_delta - ref_delta)
@@ -326,54 +326,54 @@ def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=Non
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
 
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        if not fast_sample:
-            gen_kwargs = dict(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                num_beams=num_beams,
-                top_p=top_p,
-                repetition_penalty=1.5,
-                no_repeat_ngram_size=3,
-                pad_token_id=tok.eos_token_id,
-                eos_token_id=tok.eos_token_id,
-                use_cache=True,
-                num_return_sequences=num_return_sequences,
-                # early_stopping=True,
-            )
-            # Only enable diversity when using grouped beam search
-            if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
-                gen_kwargs.update({
-                    "diversity_penalty": diversity_penalty,
-                    "num_beam_groups": num_beam_groups,
-                })
-            out = model.generate(**gen_kwargs)
-        else:
-            gen_kwargs = dict(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,          # greedy/beam
-                num_beams=num_beams,
-                num_return_sequences=num_return_sequences,
-                length_penalty=1.0,
-                early_stopping=False,
-                repetition_penalty=1.2,
-                no_repeat_ngram_size=3,
-                use_cache=True,
-                pad_token_id=tok.eos_token_id,
-                eos_token_id=tok.eos_token_id,
-            )
-            # Optional diversity for beam search only
-            if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
-                gen_kwargs.update({
-                    "diversity_penalty": diversity_penalty,
-                    "num_beam_groups": num_beam_groups,
-                })
-            out = model.generate(**gen_kwargs)
+    # with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+    if not fast_sample:
+        gen_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            num_beams=num_beams,
+            top_p=top_p,
+            repetition_penalty=1.5,
+            no_repeat_ngram_size=3,
+            pad_token_id=tok.eos_token_id,
+            eos_token_id=tok.eos_token_id,
+            use_cache=True,
+            num_return_sequences=num_return_sequences,
+            # early_stopping=True,
+        )
+        # Only enable diversity when using grouped beam search
+        if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
+            gen_kwargs.update({
+                "diversity_penalty": diversity_penalty,
+                "num_beam_groups": num_beam_groups,
+            })
+        out = model.generate(**gen_kwargs)
+    else:
+        gen_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,          # greedy/beam
+            num_beams=num_beams,
+            num_return_sequences=num_return_sequences,
+            length_penalty=1.0,
+            early_stopping=False,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
+            use_cache=True,
+            pad_token_id=tok.eos_token_id,
+            eos_token_id=tok.eos_token_id,
+        )
+        # Optional diversity for beam search only
+        if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
+            gen_kwargs.update({
+                "diversity_penalty": diversity_penalty,
+                "num_beam_groups": num_beam_groups,
+            })
+        out = model.generate(**gen_kwargs)
 
     # Keep all sequences: B prefixes × R returns
     B = input_ids.size(0)
@@ -433,7 +433,7 @@ def logprob_sum(model, tok, x_list, y_list, max_len=256):
     
 def logprob_sum_with_grad(model, tok, x_list, y_list, max_len=256):
     """Compute sum of log probabilities for y given x (inference only)."""
-
+    model.eval()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         enc_x = tok(x_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
         enc_y = tok(y_list, return_tensors="pt", padding=True, truncation=True, max_length=max_len//2).to(DEVICE)
@@ -478,8 +478,8 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     st_out = student(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
     
     # Reference forward WITHOUT gradients
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
-        rf_out = reference(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
+    # with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
+    rf_out = reference(input_ids=input_ids[:, :MAX_CONCAT], attention_mask=attn_mask[:, :MAX_CONCAT])
     
     # Shift for next-token prediction
     st_logits = st_out.logits[:, :-1, :] / temperature
@@ -496,7 +496,7 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     denom = mask_y.float().sum().clamp_min(1.0)
     return kl_tok.sum() / denom
 
-# def simple_logprob(model, tok, full_text):
+def simple_logprob(model, tok, full_text):
     """Calculate logprob of full text sequence (simpler than logprob_sum)."""
     model.eval()
     # Temporarily switch to right padding for evaluation
@@ -524,7 +524,6 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
         tok.padding_side = orig_padding_side
 
 
-@torch.no_grad()
 def mini_morph(model, tok, verbose=False):
     # Minimal morphology probe pairs
     global MORPH_STEMS, MORPH_GOOD, MORPH_BAD
@@ -628,112 +627,300 @@ def combined_loss(student, reference, tok, prefixes, y_star, kl_weight=0.03):
     
     return L_sft + kl_weight * kl_approx, L_sft, kl_approx
 
-import difflib
-import math
+import re
+import torch
 from typing import List, Tuple
 
-def _norm_logprob_per_tok(model, tok, x: str, y: str) -> float:
-    lp = logprob_sum(model, tok, [x], [y])[0].item()
-    ntoks = len(tok(y, add_special_tokens=False).input_ids)
-    return lp / max(ntoks, 1)
+def minimal_corrupt(y: str) -> str:
+    """Produce a near-miss hard negative by applying small, linguistically plausible corruptions.
+    These are intentionally simple, fast heuristics that flip grammatical features
+    (agreement, polarity, article choice) without destroying readability.
+    """
+    import re
+    if not y:
+        return ""
+    y = y.strip()
 
-def _rep_frac(text: str, n: int = 3) -> float:
-    toks = text.split()
-    if len(toks) < n+1: return 0.0
-    seen, reps = set(), 0
-    for i in range(len(toks)-n+1):
-        ng = tuple(toks[i:i+n])
-        reps += (ng in seen)
-        seen.add(ng)
-    return reps / max(len(toks)-n+1, 1)
+    rules = [
+        (r"\bis\b", "are"),
+        (r"\bare\b", "is"),
+        (r"\bwas\b", "were"),
+        (r"\bwere\b", "was"),
+        (r"\ba\b", "an"),
+        (r"\ban\b", "a"),
+        (r"\bdoes\b", "do"),
+        (r"\bdo\b", "does"),
+        (r"\bhas\b", "have"),
+        (r"\bhave\b", "has"),
+    ]
 
-def _prefix_leak(prefix: str, cand: str) -> float:
-    # penalize if cand starts with last 3–6 words of prefix
-    pw = prefix.split()[-6:]
-    cw = cand.split()[:6]
-    m = 0
-    for k in range(6, 2, -1):
-        if pw[-k:] == cw[:k]:
-            m = k; break
-    return float(m > 0)
+    # 1) deterministic first-match replace
+    for pat, repl in rules:
+        if re.search(pat, y, flags=re.IGNORECASE):
+            return re.sub(pat, repl, y, count=1, flags=re.IGNORECASE)
 
-def _jaccard(a: str, b: str) -> float:
-    sa, sb = set(a.split()), set(b.split())
-    if not sa and not sb: return 1.0
-    return len(sa & sb) / max(len(sa | sb), 1)
+    # 2) inject 'not' after the first auxiliary if no negation
+    if not re.search(r"\b(not|n't)\b", y):
+        y2 = re.sub(r"\b(is|are|was|were|does|do|did|has|have)\b", r"\1 not", y, count=1)
+        if y2 != y:
+            return y2
+
+    # 3) pluralize or singularize the final word crudely
+    words = y.split()
+    if not words:
+        return y
+    last = words[-1]
+    if last.endswith("s"):
+        words[-1] = last[:-1]
+    else:
+        words[-1] = last + "s"
+    return " ".join(words)
+
+
+_BOILER = [
+    "i didn't know what to do",
+    "i didn't want to",
+    "i don't know",
+    "i couldn't see it",
+    "it was all right",
+    "i was going to",
+]
+
+def _sanitize_completion(y: str, max_chars: int = 140) -> str:
+    y = (y or "").strip().replace("\n", " ")
+    # keep only the first sentence/segment (also split on closing quote breaks)
+    parts = re.split(r"(?<=[\.!?])\s+|['”]\s+['“]", y)
+    y = (parts[0] if parts else y).strip()
+    y = re.sub(r"\s+", " ", y)
+    if len(y) > max_chars:
+        y = y[:max_chars].rstrip() + "..."
+    return y
+
+def _is_boilerplate(y: str) -> bool:
+    s = (y or "").lower()
+    return any(p in s for p in _BOILER)
+
+def _jaccard_loose(a: str, b: str) -> float:
+    A, B = set(a.lower().split()), set(b.lower().split())
+    if not A or not B: return 0.0
+    return len(A & B) / max(1, len(A | B))
+
+def _softmax(vals: List[float], tau: float = 1.0) -> List[float]:
+    t = torch.tensor(vals, dtype=torch.float32) / max(1e-6, tau)
+    t = t - t.max()
+    p = torch.exp(t)
+    return (p / p.sum()).tolist()
+
+def _ll_and_len(model, tok, x: str, y: str) -> Tuple[float, int]:
+    xy = tok(x + y, return_tensors="pt")
+    ids = xy["input_ids"].to(model.device)
+    attn = xy.get("attention_mask", torch.ones_like(ids)).to(model.device)
+    x_ids = tok(x, return_tensors="pt")["input_ids"][0]
+    labels = torch.full_like(ids, -100)
+    labels[:, x_ids.shape[-1]:] = ids[:, x_ids.shape[-1]:]
+    out = model(input_ids=ids, attention_mask=attn, labels=labels)
+    y_tok = (labels != -100).sum().item()
+    nll = out.loss.item() * max(1, y_tok)
+    return -float(nll), int(y_tok)
+
+def _maybe_wrap(x: str) -> str:
+    # On mushy narrative prefixes, force a checkable, one-word continuation
+    if len(x.split()) >= 8 and x.strip()[-1].isalpha():
+        return f'Complete with one word: "{x} ___" Answer only the missing word.'
+    return x
+
+
 
 def build_contrastive_pairs(
-    student, reference, tok, prefixes: List[str], attempts: List[str],
-    k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 20,
-    critic = None, audit_path = None
+    student, reference, tok,
+    prefixes: List[str], attempts: List[str],
+    k_per_prefix: int = 6,
+    # uncertainty band: avoid both trivial and ambiguous extremes
+    margin_low: float = 0.3,   # min (top1 - top2)
+    margin_high: float = 2.4,  # max (top1 - top2)
+    max_len: int = 12,         # shorter = higher quality signal
+    critic=None,
+    audit_path=None,
+    # quality/confidence controls
+    min_ptlp: float = -4.0,    # critic per-token log-prob floor
+    conf_p_low: float = 0.55,  # softmax p(top) lower bound
+    conf_p_high: float = 0.90, # softmax p(top) upper bound
+    jaccard_max: float = 0.60, # ensure chosen vs rejected are meaningfully different
 ) -> Tuple[List[str], List[str], List[str]]:
     xs, chosen, rejected = [], [], []
-    student.eval()
-    reference.eval()
-    
-    # Open audit file if path provided
-    audit_file = None
-    if audit_path:
-        audit_file = open(audit_path, 'a', encoding='utf-8')
-    
+    student.eval(); reference.eval()
+    audit_file = open(audit_path, "a", encoding="utf-8") if audit_path else None
+
     try:
         for x, a0 in zip(prefixes, attempts):
-            # pool candidates
-            pool = set()
-            # pool.add((a0 or "").strip())
-            gens = []
-            # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
-            gens += complete(student, 
-                             tok, [x], 
-                             max_new_tokens=max_len, fast_sample=True, num_beams = 4,
-                              num_return_sequences=2, temperature=0.8, top_p=0.95, diversity_penalty=0.7, num_beam_groups=2)
+            xw = _maybe_wrap(x)
+            pool: List[str] = []
+
+            # seed from prior attempt if provided
+            if a0:
+                a0s = _sanitize_completion(a0)
+                if a0s and not _is_boilerplate(a0s):
+                    pool.append(a0s)
+
+            # generate candidates (diversity-friendly settings)
+            gens = complete(
+                student, tok, [xw],
+                max_new_tokens=max_len,
+                fast_sample=True,
+                num_beams=4, num_return_sequences=2,
+                temperature=0.9, top_p=0.9,
+                diversity_penalty=0.7, num_beam_groups=2,
+            )
             for g in gens:
-                if g is not None:
-                    pool.add(g.strip())
+                if not g: continue
+                y = _sanitize_completion(g)
+                if not y or _is_boilerplate(y): continue
+                if all(_jaccard_loose(y, z) < 0.6 for z in pool):
+                    pool.append(y)
                 if len(pool) >= k_per_prefix + 2:
                     break
-            cand_list = [c for c in pool if c]
 
+            cand_list = [c for c in pool if c]
             if not cand_list:
                 continue
 
-            # critic-based score
+            # critic scoring: per-token log-prob (length-normalized)
             ref_scored = []
             for y in cand_list:
-                s = _norm_logprob_per_tok(critic, tok, x, y)
-                ref_scored.append((s, y))
-
+                ll, L = _ll_and_len(critic, tok, xw, y)
+                ptlp = ll / max(1, L)
+                ref_scored.append((ptlp, y, L))
             ref_scored.sort(key=lambda t: t[0], reverse=True)
-            
-            # Write audit record - one candidate per line
+
+            # audit
             if audit_file:
-                audit_record = {
+                audit_file.write(json.dumps({
                     "prefix": x,
                     "ranked_candidates": [
-                        {"rank": i+1, "score": float(s), "text": y} 
-                        for i, (s, y) in enumerate(ref_scored)
-                    ]
-                }
-                # Pretty-print JSON with indentation
-                audit_file.write(json.dumps(audit_record, ensure_ascii=False, indent=2) + "\n\n")
+                        {"rank": i+1, "score": float(s), "len": int(L), "text": y}
+                        for i, (s, y, L) in enumerate(ref_scored)
+                    ],
+                }, ensure_ascii=False) + "\n\n")
                 audit_file.flush()
 
-            s_lo, y_lo = ref_scored[-1]
-            s_hi, y_hi = ref_scored[0]
+            # basic quality
+            s1, y1, L1 = ref_scored[0]
+            if s1 < min_ptlp or not (1 <= L1 <= max_len):
+                continue
 
-            # filter weak/near-duplicate pairs
-            if (s_hi - s_lo) < margin: 
-                continue
-            if _jaccard(y_hi, y_lo) > 0.7: 
-                continue
-            if y_hi == y_lo: 
-                continue
-            student.train()
-            xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
-    
+            # uncertainty & confidence
+            s2 = ref_scored[1][0] if len(ref_scored) > 1 else s1
+            care_margin = s1 - s2
+            pmax = max(_softmax([s for s, _, _ in ref_scored], tau=1.0))
+
+            # student top for disagreement
+            stud_scores = []
+            for y in cand_list:
+                ls, Ls = _ll_and_len(student, tok, xw, y)
+                stud_scores.append((ls / max(1, Ls), y))
+            stud_scores.sort(key=lambda t: t[0], reverse=True)
+            student_top = stud_scores[0][1]
+            disagree = (student_top != y1)
+
+            # pick a meaningful rejected
+            y_rej = None
+            for s, y, L in reversed(ref_scored):
+                if y != y1 and _jaccard_loose(y1, y) <= jaccard_max:
+                    y_rej = y
+                    break
+            if y_rej is None and disagree:
+                y_rej = student_top
+            if y_rej is None:
+                y_rej = minimal_corrupt(y1)  # fallback hard negative
+
+            uncertain = (margin_low <= care_margin <= margin_high)
+            confident = (conf_p_low <= pmax <= conf_p_high)
+            contrast_ok = _jaccard_loose(y1, y_rej) <= jaccard_max
+
+            if (uncertain and confident and contrast_ok) or disagree:
+                xs.append(x)
+                chosen.append(y1)
+                rejected.append(y_rej)
+
     finally:
-        if audit_file:
-            audit_file.close()
+        if audit_file: audit_file.close()
         student.train()
-    
+
     return xs, chosen, rejected
+
+
+# def build_contrastive_pairs(
+#     student, reference, tok, prefixes: List[str], attempts: List[str],
+#     k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 20,
+#     critic = None, audit_path = None
+# ) -> Tuple[List[str], List[str], List[str]]:
+#     xs, chosen, rejected = [], [], []
+#     student.eval()
+#     reference.eval()
+    
+#     # Open audit file if path provided
+#     audit_file = None
+#     if audit_path:
+#         audit_file = open(audit_path, 'a', encoding='utf-8')
+    
+#     try:
+#         for x, a0 in zip(prefixes, attempts):
+#             # pool candidates
+#             pool = set()
+#             # pool.add((a0 or "").strip())
+#             gens = []
+#             # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
+#             gens += complete(student, 
+#                              tok, [x], 
+#                              max_new_tokens=max_len, fast_sample=True, num_beams = 4,
+#                               num_return_sequences=2, temperature=0.8, top_p=0.95, diversity_penalty=0.7, num_beam_groups=2)
+#             for g in gens:
+#                 if g is not None:
+#                     pool.add(g.strip())
+#                 if len(pool) >= k_per_prefix + 2:
+#                     break
+#             cand_list = [c for c in pool if c]
+
+#             if not cand_list:
+#                 continue
+
+#             # critic-based score
+#             ref_scored = []
+#             for y in cand_list:
+#                 s = _norm_logprob_per_tok(critic, tok, x, y)
+#                 ref_scored.append((s, y))
+
+#             ref_scored.sort(key=lambda t: t[0], reverse=True)
+            
+#             # Write audit record - one candidate per line
+#             if audit_file:
+#                 audit_record = {
+#                     "prefix": x,
+#                     "ranked_candidates": [
+#                         {"rank": i+1, "score": float(s), "text": y} 
+#                         for i, (s, y) in enumerate(ref_scored)
+#                     ]
+#                 }
+#                 # Pretty-print JSON with indentation
+#                 audit_file.write(json.dumps(audit_record, ensure_ascii=False, indent=2) + "\n\n")
+#                 audit_file.flush()
+
+#             s_lo, y_lo = ref_scored[-1]
+#             s_hi, y_hi = ref_scored[0]
+
+#             # filter weak/near-duplicate pairs
+#             if (s_hi - s_lo) < margin: 
+#                 continue
+#             if _jaccard(y_hi, y_lo) > 0.7: 
+#                 continue
+#             if y_hi == y_lo: 
+#                 continue
+#             student.train()
+#             xs.append(x); chosen.append(y_hi); rejected.append(y_lo)
+    
+#     finally:
+#         if audit_file:
+#             audit_file.close()
+#         student.train()
+    
+#     return xs, chosen, rejected
