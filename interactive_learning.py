@@ -44,8 +44,8 @@ dynamo.config.cache_size_limit = 256
 torch._dynamo.config.disable = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-random.seed(7)
-torch.manual_seed(7)
+# random.seed(7)
+# torch.manual_seed(7)
 
 # Disable torch.compile for debugging (single line toggle)
 # torch._dynamo.config.disable = False
@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--model_path", type=str, default=None, help="Optional path to a LoRA adapter directory (with adapter_config.json) to load and merge into base using load_lora.py. If provided, overrides --model_name.")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lr", type=float, default=5e-7)
     ap.add_argument("--use_dpo", action="store_true")
     ap.add_argument("--eval_every", type=int, default=250)
     ap.add_argument("--save_dir", type=str, default="./ckpts_bnc_interactive")
@@ -318,7 +318,7 @@ def main():
             weight_decay=0.01
         )
     
-    sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=500, num_training_steps=args.steps)
+    sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=1500, num_training_steps=args.steps)
 
     budget = WordBudget(20_000_000)
     logger.info(f"Word budget: {Fore.YELLOW}{budget.limit:,}{Style.RESET_ALL} words")
@@ -348,7 +348,7 @@ def main():
         os.remove(audit_path)
         logger.info(f"Removed existing caregiver audit file at: {audit_path}")
 
-    critic_name = 'Qwen/Qwen2.5-7B-Instruct'
+    critic_name = 'Qwen/Qwen2.5-3B-Instruct'
     # critic_name = 'grammarly/coedit-xl'
     # critic_name = 'microsoft/phi-4'
     # Load critic (prefer causal LM; fallback to seq2seq if needed)
@@ -358,6 +358,7 @@ def main():
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
+        critic_tok = AutoTokenizer.from_pretrained(critic_name)
     except Exception:
         from transformers import AutoModelForSeq2SeqLM
         critic = AutoModelForSeq2SeqLM.from_pretrained(
@@ -365,6 +366,7 @@ def main():
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
+        critic_tok = AutoTokenizer.from_pretrained(critic_name)
     critic.eval()
     for p in critic.parameters():
         p.requires_grad = False
@@ -391,7 +393,7 @@ def main():
 
         # Generate short student attempts
         gen_start = time.time()
-        attempts = complete(student, tokenizer, prefixes, max_new_tokens=15, temperature=0.9)
+        attempts = complete(student, tokenizer, prefixes, max_new_tokens=5, temperature=0.9, num_beams=1)
         
         # Ensure strings for downstream typing (guard lints)
         attempts = [a if isinstance(a, str) else "" for a in attempts]
@@ -403,15 +405,19 @@ def main():
         with torch.inference_mode():  # Use inference_mode for uncertainty calculation
             uncertainties = get_uncertainty(student, tokenizer, prefixes, attempts)
 
-        # Correct top 20% most uncertain samples
-        threshold = sorted(uncertainties, reverse=True)[int(0.2 * len(uncertainties))]
-        needs_correction = [u >= threshold for u in uncertainties]
+        # Correct middle 20% most uncertain samples
+        band = 0.2
+        all = len(uncertainties)
+        half = int(len(uncertainties) / 2)
+        start = int(half - band * all / 2)
+        end = int(half + band * all / 2)
+        needs_correction = uncertainties[start:end]
         n_correct = sum(needs_correction)
 
         # Only invoke caregiver for flagged samples
         if n_correct > 0:
             # Extract samples needing correction
-            idxs_to_correct = [i for i, flag in enumerate(needs_correction) if flag]
+            idxs_to_correct = list(range(start, end))
             prefixes_subset = [prefixes[i] for i in idxs_to_correct]
             attempts_subset = [attempts[i] if isinstance(attempts[i], str) else "" for i in idxs_to_correct]
     
@@ -441,17 +447,18 @@ def main():
 
             xs, chosen, rejected = build_contrastive_pairs(
                 student, reference, tokenizer, prefixes_subset, attempts_subset,
-                k_per_prefix=6, margin=0.3, max_len=12, critic=critic, audit_path=audit_path
+                k_per_prefix=4, margin=0.5, max_len=10, critic=critic, audit_path=audit_path
             )
             if xs and chosen and rejected:
-                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.1)
+                L_dpo = dpo_loss(student, reference, tokenizer, xs, chosen, rejected, beta=0.05)
                 # last_L_dpo = L_dpo.detach()
 
             # Amortize and ramp DPO weight to avoid spikes
             # base_dpo_weight = (0.5 / dpo_interval) if args.use_dpo else 0.0
             # ramp = min(1.0, step / dpo_warmup) if args.use_dpo else 0.0
             # dpo_weight = base_dpo_weight * ramp
-
+            torch.set_grad_enabled(True)
+            student.train()
             # --- Combine losses (final total) ---
             # assert L_dpo.requires_grad, "DPO loss is detached; remove no_grad/inference_mode on student terms"
             loss = L_dpo
@@ -461,6 +468,11 @@ def main():
             loss_val = float(loss.item())
             avg_loss = loss_val if avg_loss is None else (avg_decay * avg_loss + (1.0 - avg_decay) * loss_val)
 
+            # Guards to catch future detaches
+            # assert torch.is_grad_enabled(), "Grad disabled at loss computation"
+            # assert loss.requires_grad and loss.grad_fn is not None, "Loss is detached; check for .item() or no_grad around loss"
+
+ 
             backward_start = time.time()
             opt.zero_grad(set_to_none=True)
             loss.backward()

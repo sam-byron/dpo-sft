@@ -51,7 +51,6 @@ PHENOMENON_PATTERNS = {
     "entity":     re.compile(r".*\bMary told John\b.*"),
 }
 
-# @torch.no_grad()
 def get_uncertainty(student, tok, prefixes, attempts):
     """Return per-sample uncertainty (entropy) as selection criterion (inference only)."""
     student.eval()
@@ -276,7 +275,6 @@ class Caregiver:
         results = self.correct_batch([prefix], [student])
         return results[0]
 
-# @torch.no_grad()
 def eval_blimp_hf(model, tok, n_per_cat=50, max_len=64, categories=None, progress=True):
     """Evaluate on BLiMP using shared helpers from blimp.py.
 
@@ -319,9 +317,9 @@ def batchify(items, bs):
         if not b: break
         yield b
 
-# @torch.no_grad()
 def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=None, fast_sample=False,
-             num_beams: int = 1, num_return_sequences: int = 1):
+             num_beams: int = 1, num_return_sequences: int = 1,
+             diversity_penalty: float = 0.0, num_beam_groups: int = 1):
     """Generate continuations; supports multiple return sequences per prefix."""
     model.eval()
     enc = tok(prefixes, return_tensors="pt", padding=True, truncation=True, max_length=512).to(DEVICE)
@@ -330,22 +328,31 @@ def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=Non
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.is_available() else None):
         if not fast_sample:
-            out = model.generate(
+            gen_kwargs = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
+                num_beams=num_beams,
                 top_p=top_p,
-                repetition_penalty=1.2,
+                repetition_penalty=1.5,
                 no_repeat_ngram_size=3,
                 pad_token_id=tok.eos_token_id,
                 eos_token_id=tok.eos_token_id,
                 use_cache=True,
-                num_return_sequences=num_return_sequences,  # <-- ensure R matches
+                num_return_sequences=num_return_sequences,
+                # early_stopping=True,
             )
+            # Only enable diversity when using grouped beam search
+            if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
+                gen_kwargs.update({
+                    "diversity_penalty": diversity_penalty,
+                    "num_beam_groups": num_beam_groups,
+                })
+            out = model.generate(**gen_kwargs)
         else:
-            out = model.generate(
+            gen_kwargs = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
@@ -353,13 +360,20 @@ def complete(model, tok, prefixes, max_new_tokens=20, temperature=1.0, top_p=Non
                 num_beams=num_beams,
                 num_return_sequences=num_return_sequences,
                 length_penalty=1.0,
-                early_stopping=True,
+                early_stopping=False,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
                 use_cache=True,
                 pad_token_id=tok.eos_token_id,
                 eos_token_id=tok.eos_token_id,
             )
+            # Optional diversity for beam search only
+            if (num_beams > 1) and (num_beam_groups > 1) and (diversity_penalty > 0.0):
+                gen_kwargs.update({
+                    "diversity_penalty": diversity_penalty,
+                    "num_beam_groups": num_beam_groups,
+                })
+            out = model.generate(**gen_kwargs)
 
     # Keep all sequences: B prefixes × R returns
     B = input_ids.size(0)
@@ -394,7 +408,6 @@ def ce_targets(student, tok, x_list, y_list):
     return out.loss
 
 # logprob_sum: remove incorrect divide by len(tok) and use autocast
-# @torch.no_grad()
 def logprob_sum(model, tok, x_list, y_list, max_len=256):
     """Compute sum of log probabilities for y given x (inference only)."""
     model.eval()
@@ -483,8 +496,7 @@ def kl_to_ref(student, reference, tok, xs, y_pos, y_neg: Optional[List[str]] = N
     denom = mask_y.float().sum().clamp_min(1.0)
     return kl_tok.sum() / denom
 
-# @torch.no_grad()
-def simple_logprob(model, tok, full_text):
+# def simple_logprob(model, tok, full_text):
     """Calculate logprob of full text sequence (simpler than logprob_sum)."""
     model.eval()
     # Temporarily switch to right padding for evaluation
@@ -650,7 +662,6 @@ def _jaccard(a: str, b: str) -> float:
     if not sa and not sb: return 1.0
     return len(sa & sb) / max(len(sa | sb), 1)
 
-# @torch.no_grad()
 def build_contrastive_pairs(
     student, reference, tok, prefixes: List[str], attempts: List[str],
     k_per_prefix: int = 6, margin: float = 0.4, max_len: int = 20,
@@ -674,8 +685,8 @@ def build_contrastive_pairs(
             # gens += complete(student, tok, [x], max_new_tokens=max_len, temperature=0.6, top_p=0.7, fast_sample=False)
             gens += complete(student, 
                              tok, [x], 
-                             max_new_tokens=max_len, fast_sample=False, 
-                             num_beams=8, num_return_sequences=8, temperature=0.4, top_p=0.8)
+                             max_new_tokens=max_len, fast_sample=True, num_beams = 4,
+                              num_return_sequences=2, temperature=0.8, top_p=0.95, diversity_penalty=0.7, num_beam_groups=2)
             for g in gens:
                 if g is not None:
                     pool.add(g.strip())
